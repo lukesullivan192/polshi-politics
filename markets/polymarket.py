@@ -52,7 +52,7 @@ def _to_row(event: dict, market: dict, group: str) -> dict:
         "market_id": market["slug"],
         "event_id": event["slug"],
         "category": group,
-        "title": market.get("question") or event.get("title"),
+        "title": event.get("title"),
         "outcome": market.get("title"),
         "status": "open",
         # Event endDate is the release/decision date; market endDate adds a ~2 week buffer.

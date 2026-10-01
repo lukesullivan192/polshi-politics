@@ -53,7 +53,7 @@ def _to_row(event: dict, market: dict, group: str) -> dict:
         "market_id": market["ticker"],
         "event_id": market.get("event_ticker") or event["event_ticker"],
         "category": group,
-        "title": market.get("title") or event.get("title"),
+        "title": event.get("title"),
         "outcome": market.get("yes_sub_title"),
         "status": "open",
         "resolution_date": to_utc_iso(market.get("expected_expiration_time")),

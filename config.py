@@ -31,11 +31,8 @@ CATEGORIES = {
     "kalshi": {
         "Politics": "politics",
         "Elections": "politics",
-        "Economics": "econ",
     },
     "polymarket": {
         "politics": "politics",
-        "macro": "econ",
-        "finance": "econ",
     },
 }

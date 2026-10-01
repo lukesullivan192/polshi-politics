@@ -8,10 +8,10 @@ CREATE TABLE IF NOT EXISTS markets (
     venue       TEXT NOT NULL,  -- 'kalshi' or 'polymarket'
     market_id   TEXT NOT NULL,  -- Kalshi ticker or Polymarket US market slug
     event_id    TEXT,           -- groups related markets (buckets/rungs/candidates of one event)
-    category    TEXT,           -- our group: 'politics' or 'econ'
+    category    TEXT,           -- our group (currently only 'politics')
     title       TEXT,           -- the event-level question
     outcome     TEXT,           -- the bucket/candidate this market is for
-    status      TEXT,           -- 'open', 'closed' or 'missing'
+    status      TEXT,           -- always 'open' (only open markets are stored)
     resolution_date TEXT,       -- UTC ISO; when the result is expected to be determined (payout)
     rules_text  TEXT,
     last_seen   TEXT NOT NULL,  -- UTC ISO of the last run that returned this market
