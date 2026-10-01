@@ -19,7 +19,9 @@ venv/
 node_modules/
 dist/
 
-# Data / logs
+# Data / logs (databases live in data/<name>/<name>.db, alerts in logs/)
+data/
+logs/
 *.log
 *.sqlite
 *.db
