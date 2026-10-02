@@ -87,7 +87,7 @@ class TradeEngine:
         self.halted = False
         self._positions = {p.position_id: p for p in self._load_positions()}
         log.info(
-            "trades engine: %s, %d open positions, $%s deployed",
+            "trades engine: %s, %d open positions, $%.2f deployed",
             "DRY RUN" if config.DRY_RUN else "LIVE", len(self._positions), self._exposure(),
         )
 
