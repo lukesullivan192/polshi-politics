@@ -26,7 +26,7 @@ mkdir -p keys            # put your Kalshi private key at keys/kalshi.pem (*.pem
 | setting | where to get it |
 |---|---|
 | `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH` | Kalshi account settings → API keys (RSA or Ed25519 PEM) |
-| `POLYMARKET_API_KEY_ID`, `POLYMARKET_API_SECRET` | Polymarket US developer settings (base64 Ed25519 secret) |
+| `POLYMARKET_API_KEY_ID`, `POLYMARKET_API_SECRET` | Polymarket US developer settings (base64 Ed25519 secret, or a path to a file holding it, e.g. `keys/polymarket.key`) |
 
 `config.py` reads these from `.env`. Don't put keys in `config.py` itself: it's committed. Without keys the bot still refreshes markets and matchings, but finds no opportunities.
 

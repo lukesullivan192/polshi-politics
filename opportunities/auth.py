@@ -59,5 +59,5 @@ def _polymarket_key() -> ed25519.Ed25519PrivateKey:
     try:
         secret = base64.b64decode(config.POLYMARKET_API_SECRET, validate=True)
     except ValueError as e:
-        raise ValueError(f"POLYMARKET_API_SECRET in .env isn't valid base64 ({e}); paste the secret key exactly") from None
+        raise ValueError(f"POLYMARKET_API_SECRET in .env isn't valid base64 ({e}); paste the secret key, or a path to a file holding it") from None
     return ed25519.Ed25519PrivateKey.from_private_bytes(secret[:32])

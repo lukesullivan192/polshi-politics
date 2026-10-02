@@ -33,7 +33,10 @@ KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID", "")
 # RSA or Ed25519 PEM; a relative path is relative to the repo root.
 KALSHI_PRIVATE_KEY_PATH = ROOT / os.getenv("KALSHI_PRIVATE_KEY_PATH", "keys/kalshi.pem")
 POLYMARKET_API_KEY_ID = os.getenv("POLYMARKET_API_KEY_ID", "")
-POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")  # base64 Ed25519 secret
+# Base64 Ed25519 secret, or a path to a file holding it (relative paths are relative to the repo root).
+POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "").strip()
+if POLYMARKET_API_SECRET and (ROOT / POLYMARKET_API_SECRET).is_file():
+    POLYMARKET_API_SECRET = (ROOT / POLYMARKET_API_SECRET).read_text().strip()
 
 # Websocket order book feeds
 KALSHI_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
