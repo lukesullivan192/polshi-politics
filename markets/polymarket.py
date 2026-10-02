@@ -54,8 +54,8 @@ def _to_row(event: dict, market: dict, group: str) -> dict:
         "category": group,
         "title": event.get("title"),
         "outcome": market.get("title"),
-        "status": "open",
         # Event endDate is the release/decision date; market endDate adds a ~2 week buffer.
         "resolution_date": to_utc_iso(event.get("endDate")),
         "rules_text": market.get("description") or None,
+        "fee_multiplier": None,
     }

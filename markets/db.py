@@ -11,9 +11,9 @@ CREATE TABLE IF NOT EXISTS markets (
     category    TEXT,           -- our group (currently only 'politics')
     title       TEXT,           -- the event-level question
     outcome     TEXT,           -- the bucket/candidate this market is for
-    status      TEXT,           -- always 'open' (only open markets are stored)
     resolution_date TEXT,       -- UTC ISO; when the result is expected to be determined (payout)
     rules_text  TEXT,
+    fee_multiplier REAL,        -- Kalshi series fee multiplier (taker fee scale); NULL for Polymarket US
     last_seen   TEXT NOT NULL,  -- UTC ISO of the last run that returned this market
     PRIMARY KEY (venue, market_id)
 );
@@ -23,14 +23,20 @@ CREATE INDEX IF NOT EXISTS idx_markets_category ON markets (category);
 
 COLUMNS = (
     "venue", "market_id", "event_id", "category", "title", "outcome",
-    "status", "resolution_date", "rules_text", "last_seen",
+    "resolution_date", "rules_text", "fee_multiplier", "last_seen",
 )
 
 
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # The review CLI reads this DB while the bot writes it, so wait on locks and use WAL.
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    # Columns added after the first release; CREATE TABLE IF NOT EXISTS won't add them to an old DB.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(markets)")}
+    if "fee_multiplier" not in columns:
+        conn.execute("ALTER TABLE markets ADD COLUMN fee_multiplier REAL")
     return conn
 
 

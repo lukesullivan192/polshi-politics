@@ -16,6 +16,7 @@ VENUE = "kalshi"
 async def fetch_markets(session: aiohttp.ClientSession) -> list[dict]:
     """Page through all open events (with nested markets) and keep active markets in tracked categories."""
     categories = config.CATEGORIES[VENUE]
+    fee_multipliers = await _fee_multipliers(session)
     url = f"{config.KALSHI_BASE_URL}/events"
     rows: dict[str, dict] = {}
     cursor = ""
@@ -38,7 +39,8 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list[dict]:
             for market in event.get("markets") or []:
                 if market.get("status") != "active":
                     continue
-                rows[market["ticker"]] = _to_row(event, market, group)
+                fee_multiplier = fee_multipliers.get(event.get("series_ticker"))
+                rows[market["ticker"]] = _to_row(event, market, group, fee_multiplier)
         cursor = data.get("cursor")
         if not cursor or not events:
             break
@@ -46,7 +48,19 @@ async def fetch_markets(session: aiohttp.ClientSession) -> list[dict]:
     return list(rows.values())
 
 
-def _to_row(event: dict, market: dict, group: str) -> dict:
+async def _fee_multipliers(session: aiohttp.ClientSession) -> dict[str, float]:
+    """Series ticker -> taker fee multiplier, for every series in the tracked categories."""
+    out = {}
+    for category in config.CATEGORIES[VENUE]:
+        data = await get_json(session, f"{config.KALSHI_BASE_URL}/series", {"category": category})
+        for series in data.get("series") or []:
+            if series.get("fee_type") != "quadratic":
+                log.warning("kalshi series %s has fee_type %r; fees assume quadratic", series.get("ticker"), series.get("fee_type"))
+            out[series["ticker"]] = series.get("fee_multiplier")
+    return out
+
+
+def _to_row(event: dict, market: dict, group: str, fee_multiplier: float | None) -> dict:
     rules = "\n\n".join(r for r in (market.get("rules_primary"), market.get("rules_secondary")) if r)
     return {
         "venue": VENUE,
@@ -55,7 +69,7 @@ def _to_row(event: dict, market: dict, group: str) -> dict:
         "category": group,
         "title": event.get("title"),
         "outcome": market.get("yes_sub_title"),
-        "status": "open",
         "resolution_date": to_utc_iso(market.get("expected_expiration_time")),
         "rules_text": rules or None,
+        "fee_multiplier": fee_multiplier,
     }
