@@ -30,11 +30,21 @@ class OpportunityEngine:
         self._changed = asyncio.Event()
         self._open: dict[int, tuple[Opportunity, float, Decimal]] = {}  # pair_id -> (latest, opened at, peak profit)
 
+    @property
+    def pairs(self) -> dict[int, Pair]:
+        return self._pairs
+
     def start(self, session: aiohttp.ClientSession) -> list[asyncio.Task]:
         return [asyncio.create_task(feed.run(session)) for feed in (self.kalshi, self.poly)]
 
-    def reload_pairs(self, markets_conn: sqlite3.Connection, matchings_conn: sqlite3.Connection) -> None:
-        """Load verified pairs (call after each refresh) and point the feeds at their markets."""
+    def reload_pairs(
+        self,
+        markets_conn: sqlite3.Connection,
+        matchings_conn: sqlite3.Connection,
+        held: dict[str, set[str]] | None = None,
+    ) -> None:
+        """Load verified pairs (call after each refresh) and point the feeds at their markets, plus any
+        `held` markets (venue -> market ids with open positions)."""
         markets = {
             (venue, market_id): (resolution_date, fee_multiplier)
             for venue, market_id, resolution_date, fee_multiplier in markets_conn.execute(
@@ -65,8 +75,9 @@ class OpportunityEngine:
             self._pairs_by_market.setdefault(("polymarket", pair.poly_slug), []).append(pair.pair_id)
         for pair_id in [p for p in self._open if p not in pairs]:
             self._close(pair_id, "pair no longer verified")
-        self.kalshi.set_markets(p.kalshi_market_id for p in pairs.values())
-        self.poly.set_markets(p.poly_slug for p in pairs.values())
+        held = held or {}
+        self.kalshi.set_markets({p.kalshi_market_id for p in pairs.values()} | held.get("kalshi", set()))
+        self.poly.set_markets({p.poly_slug for p in pairs.values()} | held.get("polymarket", set()))
         self._dirty.update(pairs)
         self._changed.set()
         log.info("opportunity engine: %d verified pairs", len(pairs))

@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import config
 from opportunities import auth
-from opportunities.book import Book, complement_asks
+from opportunities.book import Book, complement_asks, sorted_bids
 from opportunities.feed import BookFeed, FeedError
 
 log = logging.getLogger(__name__)
@@ -67,13 +67,18 @@ class KalshiFeed(BookFeed):
                 levels[price] = qty
             else:
                 levels.pop(price, None)
-        self._on_update(self.venue, ticker)
+        self._notify(ticker)
 
     def book(self, market_id: str) -> Book | None:
         bids = self._bids.get(market_id)
         if bids is None:
             return None
-        return Book(yes_asks=complement_asks(bids["no"].items()), no_asks=complement_asks(bids["yes"].items()))
+        return Book(
+            yes_asks=complement_asks(bids["no"].items()),
+            no_asks=complement_asks(bids["yes"].items()),
+            yes_bids=sorted_bids(bids["yes"].items()),
+            no_bids=sorted_bids(bids["no"].items()),
+        )
 
     def market_ids(self) -> list[str]:
         return list(self._bids)

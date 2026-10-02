@@ -15,7 +15,7 @@ import config
 from opportunities.book import Book, Level
 from opportunities.fees import kalshi_fee, polymarket_fee
 
-QTY_STEP = Decimal("0.01")  # budget-capped sizes are rounded down to this many contracts
+QTY_STEP = Decimal("0.01")  # cost-capped sizes are rounded down to this many contracts
 
 SIDE_PAIRS = {  # flipped -> [(kalshi side, polymarket side)]
     0: [("yes", "no"), ("no", "yes")],
@@ -61,39 +61,64 @@ class Opportunity:
         return self.pair_id, self.kalshi.side, self.poly.side
 
 
-def best_opportunity(pair: Pair, kalshi_book: Book, poly_book: Book, now: datetime) -> Opportunity | None:
-    """The better of the pair's two directions by daily rate, or None if neither is profitable."""
-    days = max((pair.resolution_date - now).total_seconds() / 86400, config.RATE_MIN_DAYS)
+def best_opportunity(
+    pair: Pair,
+    kalshi_book: Book,
+    poly_book: Book,
+    now: datetime,
+    max_qty: Decimal | None = None,
+    max_cost: Decimal | None = None,
+    sides: tuple[str, str] | None = None,
+) -> Opportunity | None:
+    """The better of the pair's two directions by daily rate, or None if neither is profitable.
+
+    `max_qty` caps contracts per leg and `max_cost` caps contract cost (both legs); `sides` pins one
+    (kalshi side, polymarket side) direction.
+    """
+    days = days_until(pair.resolution_date, now)
     best = None
-    for k_side, p_side in SIDE_PAIRS[pair.flipped]:
-        opp = _evaluate(pair, k_side, kalshi_book.asks(k_side), p_side, poly_book.asks(p_side), days)
+    for k_side, p_side in [sides] if sides else SIDE_PAIRS[pair.flipped]:
+        opp = _evaluate(pair, k_side, kalshi_book.asks(k_side), p_side, poly_book.asks(p_side), days, max_qty, max_cost)
         if opp and (best is None or opp.rate_per_day > best.rate_per_day):
             best = opp
     return best
 
 
-def _evaluate(pair: Pair, k_side: str, k_asks: list[Level], p_side: str, p_asks: list[Level], days: float):
+def days_until(when: datetime, now: datetime) -> float:
+    return max((when - now).total_seconds() / 86400, config.RATE_MIN_DAYS)
+
+
+def daily_rate(final: Decimal, initial: Decimal, days: float) -> float:
+    """(final / initial) ** (1 / days) - 1: the compound daily return of turning `initial` into `final`."""
+    return float(final / initial) ** (1 / days) - 1 if initial > 0 else 0.0
+
+
+def _evaluate(pair, k_side, k_asks: list[Level], p_side, p_asks: list[Level], days, max_qty, max_cost):
     """Walk both ask ladders together, cheapest first, while a contract on each still costs < $1.
 
-    Returns the size with the most total profit after fees, capped at MAX_TRADE_SIZE_USD of contract cost.
+    Returns the size with the most total profit after fees, within the caps.
     """
     k_fills: list[Level] = []
     p_fills: list[Level] = []
     i = j = 0
     k_left = k_asks[0][1] if k_asks else Decimal(0)
     p_left = p_asks[0][1] if p_asks else Decimal(0)
-    spent = Decimal(0)
+    bought = spent = Decimal(0)
     best = None
     while i < len(k_asks) and j < len(p_asks):
         k_price, p_price = k_asks[i][0], p_asks[j][0]
         if k_price + p_price >= 1:
             break
-        affordable = ((config.MAX_TRADE_SIZE_USD - spent) / (k_price + p_price)).quantize(QTY_STEP, ROUND_FLOOR)
-        if affordable <= 0:
+        qty = min(k_left, p_left)
+        if max_qty is not None:
+            qty = min(qty, max_qty - bought)
+        if max_cost is not None:
+            qty = min(qty, ((max_cost - spent) / (k_price + p_price)).quantize(QTY_STEP, ROUND_FLOOR))
+        if qty <= 0:
             break
-        qty = min(k_left, p_left, affordable)
         k_fills.append((k_price, qty))
         p_fills.append((p_price, qty))
+        bought += qty
         spent += qty * (k_price + p_price)
         opp = _build(pair, k_side, k_fills, p_side, p_fills, days)
         if opp.profit > 0 and (best is None or opp.profit > best.profit):
@@ -116,8 +141,7 @@ def _build(pair: Pair, k_side: str, k_fills: list[Level], p_side: str, p_fills: 
     cost = kalshi.cost + poly.cost
     fees = kalshi.fee + poly.fee
     initial = cost + fees
-    rate = float(qty / initial) ** (1 / days) - 1 if initial > 0 else 0.0
-    return Opportunity(pair.pair_id, kalshi, poly, qty, cost, fees, qty - initial, days, rate)
+    return Opportunity(pair.pair_id, kalshi, poly, qty, cost, fees, qty - initial, days, daily_rate(qty, initial, days))
 
 
 def _leg(venue: str, market_id: str, side: str, fills: list[Level], fee: Decimal) -> Leg:

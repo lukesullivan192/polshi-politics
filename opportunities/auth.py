@@ -56,4 +56,8 @@ def _kalshi_key():
 
 @cache
 def _polymarket_key() -> ed25519.Ed25519PrivateKey:
-    return ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(config.POLYMARKET_API_SECRET)[:32])
+    try:
+        secret = base64.b64decode(config.POLYMARKET_API_SECRET, validate=True)
+    except ValueError as e:
+        raise ValueError(f"POLYMARKET_API_SECRET in .env isn't valid base64 ({e}); paste the secret key exactly") from None
+    return ed25519.Ed25519PrivateKey.from_private_bytes(secret[:32])

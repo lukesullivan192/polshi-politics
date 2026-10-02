@@ -16,6 +16,7 @@ TRADING_LOOP_DELAY_SECONDS = 0  # pause between trading cycles
 # Storage
 MARKETS_DB_PATH = ROOT / "data" / "markets" / "markets.db"
 MATCHINGS_DB_PATH = ROOT / "data" / "matchings" / "matchings.db"
+TRADES_DB_PATH = ROOT / "data" / "trades" / "trades.db"
 LOG_PATH = ROOT / "logs" / "polshi.log"
 
 # APIs (public market data, no auth needed)
@@ -23,6 +24,7 @@ KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_PAGE_SIZE = 200  # API max
 
 POLYMARKET_BASE_URL = "https://gateway.polymarket.us/v1"
+POLYMARKET_TRADING_URL = "https://api.polymarket.us/v1"  # orders and portfolio (authenticated)
 POLYMARKET_PAGE_SIZE = 200
 
 # API keys (needed for the websocket order book feeds). Set them in .env, which is gitignored;
@@ -70,6 +72,10 @@ KALSHI_TAKER_FEE_RATE = Decimal("0.07")  # times the series' fee_multiplier; rou
 POLYMARKET_TAKER_FEE_RATE = Decimal("0.0695")  # schedule effective 2026-10-01; banker's rounding to the cent
 
 # Opportunity engine (pairs only; no minimum edge or profit, every profitable arb is logged)
-MAX_TRADE_SIZE_USD = Decimal("100")  # caps an opportunity's contract cost (both legs)
-MAX_PORTFOLIO_SIZE_USD = Decimal("1000")  # total capital deployed; enforced by the execution engine (not built)
-RATE_MIN_DAYS = 1  # days to resolution are floored at this when computing the daily rate
+RATE_MIN_DAYS = 1  # days (to resolution, or held) are floored at this when computing daily rates
+
+# Trades engine
+DRY_RUN = True  # simulate fills against the live books instead of sending orders; set False to trade for real
+MAX_TRADE_SIZE_USD = Decimal("100")  # most contract cost (both legs, before fees) in open positions on one pair
+MAX_PORTFOLIO_SIZE_USD = Decimal("1000")  # most contract cost in open positions across all pairs
+ORDER_TIMEOUT_SECONDS = 10  # an order whose result doesn't come back in time halts trading (state unknown)

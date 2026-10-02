@@ -1,8 +1,9 @@
 """Entry point: one loop that alternates between refreshing data and trading.
 
 Every REFRESH_INTERVAL_SECONDS it refreshes markets (both venues) and then matchings; the rest
-of the time it runs trading cycles back to back. Trading never runs during a refresh. The websocket
-order book feeds run in the background the whole time.
+of the time it runs trading cycles back to back: find opportunities, then cash out, unwind and enter
+trades. Trading never runs during a refresh. The websocket order book feeds run in the background
+the whole time.
 """
 
 import asyncio
@@ -17,6 +18,8 @@ from markets.timeutil import utc_now_iso
 from matching import db as matchings_db
 from matching.matcher import refresh_matchings
 from opportunities.engine import OpportunityEngine
+from trades import db as trades_db
+from trades.engine import TradeEngine
 
 log = logging.getLogger("polshi")
 
@@ -52,24 +55,28 @@ async def update_markets(session: aiohttp.ClientSession, conn) -> None:
     log.info("market update finished in %.1fs", time.monotonic() - start)
 
 
-async def refresh(session, markets_conn, matchings_conn, engine: OpportunityEngine) -> None:
+async def refresh(session, markets_conn, matchings_conn, engine: OpportunityEngine, trader: TradeEngine) -> None:
     await update_markets(session, markets_conn)
     refresh_matchings(markets_conn, matchings_conn)
-    engine.reload_pairs(markets_conn, matchings_conn)
+    trader.settle(markets_conn)
+    engine.reload_pairs(markets_conn, matchings_conn, trader.held_markets())
 
 
-async def trading_cycle(engine: OpportunityEngine, timeout: float) -> None:
-    """Find opportunities (waits up to `timeout` for a book change). Execution engine not built yet."""
-    await engine.cycle(timeout)
+async def trading_cycle(engine: OpportunityEngine, trader: TradeEngine, timeout: float) -> None:
+    """Find opportunities (waits up to `timeout` for a book change), then cash out, unwind and enter."""
+    opportunities = await engine.cycle(timeout)
+    await trader.cycle(opportunities)
 
 
 async def main() -> None:
     setup_logging()
     markets_conn = markets_db.connect(config.MARKETS_DB_PATH)
     matchings_conn = matchings_db.connect(config.MATCHINGS_DB_PATH)
+    trades_conn = trades_db.connect(config.TRADES_DB_PATH)
     timeout = aiohttp.ClientTimeout(total=config.REQUEST_TIMEOUT_SECONDS)
     engine = OpportunityEngine()
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        trader = TradeEngine(trades_conn, engine, session)
         feeds = engine.start(session)  # noqa: F841 (keeps a reference so the tasks aren't collected)
         last_refresh = None
         while True:
@@ -77,12 +84,12 @@ async def main() -> None:
             if until_refresh <= 0:
                 last_refresh = time.monotonic()
                 try:
-                    await refresh(session, markets_conn, matchings_conn, engine)
+                    await refresh(session, markets_conn, matchings_conn, engine, trader)
                 except Exception:
                     log.exception("refresh crashed")
                 continue
             try:
-                await trading_cycle(engine, until_refresh)
+                await trading_cycle(engine, trader, until_refresh)
             except Exception:
                 log.exception("trading cycle crashed")
             await asyncio.sleep(config.TRADING_LOOP_DELAY_SECONDS)

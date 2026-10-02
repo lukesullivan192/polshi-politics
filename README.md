@@ -7,7 +7,7 @@ A bot for finding arbitrage between politics and elections markets on [Kalshi](h
 - **Market fetcher**: done. Fetches all open politics and elections markets from both venues into SQLite.
 - **Market matcher**: done. Proposes Kalshi/Polymarket US pairs by fuzzy matching; every pair is verified by hand, and verified pairs are auto-suspended when either side's rules change.
 - **Opportunity engine**: done. Streams order books for every verified pair over both venues' websockets and logs each arb (after fees) when it opens and closes, ranked by daily rate.
-- Execution engine is not built yet.
+- **Trades engine**: built, running in dry-run mode (`DRY_RUN = True`). Enters arbs, sells one-legged fills, cashes out when that beats holding, and logs every order to `data/trades/trades.db` and the log. Live order placement is written but hasn't been run against the venues yet.
 
 ## Setup
 
@@ -36,7 +36,7 @@ mkdir -p keys            # put your Kalshi private key at keys/kalshi.pem (*.pem
 venv/bin/python main.py
 ```
 
-One loop handles everything. Every `REFRESH_INTERVAL_SECONDS` (10 minutes) it refreshes markets, then matchings, then points the order book feeds at the verified pairs; the rest of the time it runs trading cycles back to back, `TRADING_LOOP_DELAY_SECONDS` (0) apart. A trading cycle waits for a book change, so an idle market doesn't spin the CPU. Trading never runs during a refresh; the feeds keep streaming in the background. Logs go to `logs/polshi.log` and the console. Stop with Ctrl+C.
+One loop handles everything. Every `REFRESH_INTERVAL_SECONDS` (10 minutes) it refreshes markets, then matchings, settles positions whose markets are gone, then points the order book feeds at the verified pairs and any markets with open positions; the rest of the time it runs trading cycles back to back, `TRADING_LOOP_DELAY_SECONDS` (0) apart. A trading cycle waits for a book change, so an idle market doesn't spin the CPU. Trading never runs during a refresh; the feeds keep streaming in the background. Logs go to `logs/polshi.log` and the console. Stop with Ctrl+C.
 
 Review pairs by hand (safe to run while the bot is running):
 
@@ -72,8 +72,16 @@ opportunities/
   fees.py          taker fees for each venue
   evaluate.py      arb math for one pair (pure, no I/O)
   engine.py        loads verified pairs, re-evaluates on book changes, logs OPEN/CLOSED, ranks
+trades/
+  engine.py        sizing, entries, one-leg unwinds, cashouts, settlement, DB + log records
+  kalshi.py        live Kalshi orders (POST /portfolio/events/orders, V2 YES-book bid/ask)
+  polymarket.py    live Polymarket US orders (POST /v1/orders, synchronous execution)
+  paper.py         DRY_RUN client: fills against the live books, remembers what it took
+  orders.py        order request / fill types
+  db.py            positions and orders schema
 data/markets/markets.db      created on first run (gitignored)
 data/matchings/matchings.db  created on first run (gitignored)
+data/trades/trades.db        created on first run (gitignored)
 logs/polshi.log              created on first run (gitignored)
 ```
 
@@ -166,4 +174,79 @@ Kalshi's book only has bids, so a YES ask at `p` is a NO bid at `1 - p`. Polymar
 
 **Staleness.** When a feed disconnects, its books are dropped, so any open opportunity on that venue closes. A Kalshi `seq` gap forces a reconnect and fresh snapshots.
 
-`MAX_PORTFOLIO_SIZE_USD` is in `config.py` for the execution engine, which isn't built yet.
+The engine logs every profitable opportunity at its full depth. The trades engine decides how much of each one to take.
+
+## Trades engine
+
+Each trading cycle, after the opportunity engine has re-evaluated changed pairs, the trades engine:
+1. retries selling any one-legged (`unhedged`) position,
+2. checks every open position for a cashout,
+3. walks the opportunities, best daily rate first, and enters what fits.
+
+With `DRY_RUN = True` (the default) nothing is sent. `trades/paper.py` fills each order against the live websocket books, and remembers what it took from each market until that market's book next changes. Paper positions are stored with `dry_run = 1` and are kept separate from live ones.
+
+### Settings (`config.py`)
+
+| setting | meaning |
+|---|---|
+| `DRY_RUN` | `True`: simulate fills. `False`: send real orders |
+| `MAX_TRADE_SIZE_USD` | most contract cost (both legs, before fees) in open positions on **one pair**, summed across repeat entries |
+| `MAX_PORTFOLIO_SIZE_USD` | most contract cost in open positions across all pairs. Each venue needs its own share of this in cash; the engine doesn't check balances |
+| `ORDER_TIMEOUT_SECONDS` | how long to wait for an order's result before treating it as unknown |
+
+### Entry
+- **Size.** Half the contracts available at profitable prices (the full opportunity's depth), rounded down to whole contracts. It's also capped by whatever room is left under both limits, so a pair that shows up again only tops up to `MAX_TRADE_SIZE_USD`.
+- **Prices.** Each leg's limit is the worst price the full opportunity reaches, so there's twice the depth needed at or below it. If filling everything at those limits would lose money, the limits drop to the prices the smaller size needs.
+- **Orders.** Both legs are sent at once with `asyncio.gather` as fill-or-kill orders.
+- **One leg fills, the other is killed:** the filled leg is sold straight away into the bids (immediate-or-cancel), and the position is logged and closed with reason `unwind`. If the bids can't absorb everything, the rest is retried every cycle.
+- **An order's result is unknown** (timeout, network error, 5xx): trading halts with a `CRITICAL` log line until restart, because the order may or may not have filled. Check both venues by hand before restarting.
+
+### Cashout
+An open position is sold when selling now earns a better daily rate than holding to resolution:
+
+```
+(payout / initial) ^ (1 / days_held) − 1  >  (final / initial) ^ (1 / days_total) − 1
+```
+
+- `payout`: what both legs fetch selling the whole position into the current bids, after fees
+- `initial`: entry cost plus entry fees
+- `final`: contracts held (each pays $1)
+- `days_held`: days since entry
+- `days_total`: days from entry to resolution
+
+Both day counts are floored at `RATE_MIN_DAYS` (1). Within the first day this means any payout above `initial` plus about one day of the hold rate triggers a cashout.
+
+Both legs are sold at once as fill-or-kill orders. If only one sells, the other is sold straight away (immediate-or-cancel).
+
+### Settlement
+When both of a position's markets have left the venues (they've closed), the position is closed with reason `settled`, assuming the winning leg pays $1 per contract.
+
+### `positions` table (`data/trades/trades.db`)
+
+One row per entry. Money is stored as decimal text.
+
+| column | meaning |
+|---|---|
+| `position_id`, `pair_id` | ids |
+| `kalshi_market_id`, `kalshi_side`, `poly_slug`, `poly_side` | the two legs (`yes`/`no`) |
+| `kalshi_fee_multiplier` | Kalshi fee multiplier at entry, for exit fees |
+| `qty` | contracts bought per leg |
+| `kalshi_qty`, `poly_qty` | contracts still held per leg |
+| `cost`, `fees` | entry contract cost and fees, both legs |
+| `exit_proceeds`, `exit_fees` | from sales (unwind or cashout), or $1 per contract on settlement |
+| `resolution_date` | the later of the two markets' resolution dates |
+| `status` | `open` (hedged), `unhedged` (one leg left to sell), `closed` |
+| `close_reason` | `unwind`, `cashout` or `settled` |
+| `profit` | `exit_proceeds − exit_fees − cost − fees`, set on close |
+| `opened_at`, `closed_at` | UTC ISO |
+| `dry_run` | 1 for paper positions |
+
+### `orders` table
+
+One row per order sent or simulated: `position_id`, `pair_id`, `purpose` (`entry`, `unwind`, `cashout`), `venue`, `market_id`, `side`, `action` (`buy`/`sell`), `tif` (`fok`/`ioc`), `qty_requested`, `limit_price` (price of `side`), `status` (`filled`, `partial`, `killed`, `rejected`, `unknown`), `qty_filled`, `avg_price`, `fee`, `exchange_order_id`, `error`, `dry_run`, `created_at`.
+
+Every order and position change is also logged (`ORDER …`, `ENTER …`, `POSITION … opened/closed`, `CASHOUT …`), with a `[DRY]` prefix in dry runs.
+
+### Before going live
+- Run in dry-run mode, then check `data/trades/trades.db` and the log.
+- The live clients follow the venues' docs, but haven't placed an order yet. Before trusting a fill, compare the first live fills (prices on NO orders especially, which both venues quote in YES terms) against each venue's website.

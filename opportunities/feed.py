@@ -26,6 +26,7 @@ class BookFeed:
         self._markets: frozenset[str] = frozenset()
         self._markets_changed = asyncio.Event()
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self.versions: dict[str, int] = {}  # market_id -> bumped on every book change
         self._closing: asyncio.Task | None = None
 
     # Implemented by each venue.
@@ -86,9 +87,13 @@ class BookFeed:
             await asyncio.sleep(delay)
             delay = min(delay * 2, config.WS_RECONNECT_MAX_DELAY_SECONDS)
 
+    def _notify(self, market_id: str) -> None:
+        self.versions[market_id] = self.versions.get(market_id, 0) + 1
+        self._on_update(self.venue, market_id)
+
     def _clear_books(self) -> None:
         """Books go stale the moment the connection drops, so forget them rather than trade on them."""
         stale = self.market_ids()
         self.drop_books()
         for market_id in stale:
-            self._on_update(self.venue, market_id)
+            self._notify(market_id)

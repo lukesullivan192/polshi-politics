@@ -1,7 +1,7 @@
 """Polymarket US order books over the markets websocket (SUBSCRIPTION_TYPE_MARKET_DATA).
 
 Each `marketData` message carries the market's full book: `bids` and `offers` for YES. NO asks come
-from the YES bids. At most 100 markets fit in one subscription, so larger sets are split.
+from the YES bids and NO bids from the YES offers. At most 100 markets fit in one subscription, so larger sets are split.
 """
 
 import logging
@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import config
 from opportunities import auth
-from opportunities.book import Book, complement_asks
+from opportunities.book import Book, complement_asks, complement_bids, sorted_bids
 from opportunities.feed import BookFeed
 
 log = logging.getLogger(__name__)
@@ -54,8 +54,13 @@ class PolymarketFeed(BookFeed):
         else:
             bids = [(_px(level), Decimal(level["qty"])) for level in data.get("bids") or []]
             offers = [(_px(level), Decimal(level["qty"])) for level in data.get("offers") or []]
-            self._books[slug] = Book(yes_asks=sorted(offers), no_asks=complement_asks(bids))
-        self._on_update(self.venue, slug)
+            self._books[slug] = Book(
+                yes_asks=sorted(offers),
+                no_asks=complement_asks(bids),
+                yes_bids=sorted_bids(bids),
+                no_bids=complement_bids(offers),
+            )
+        self._notify(slug)
 
     def book(self, market_id: str) -> Book | None:
         return self._books.get(market_id)
