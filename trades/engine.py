@@ -1,10 +1,12 @@
 """Trades engine: enters arbs, sells one-legged fills straight away, and cashes out when that beats holding.
 
 Entry. For each opportunity (best daily rate first) it buys half the contracts available at the prices
-it wants as fill-or-kill orders, Kalshi first and Polymarket only once Kalshi has filled, within
-MAX_TRADE_SIZE_USD per pair and MAX_PORTFOLIO_SIZE_USD overall, skipping any whose continuous daily rate
-(at the size taken) is below MIN_RATE_PER_DAY or above MAX_RATE_PER_DAY (too good to
-be real: usually a book flicker that's gone before our order lands). A pair isn't entered again within ENTRY_COOLDOWN_SECONDS of an attempt,
+it wants as fill-or-kill orders, within MAX_TRADE_SIZE_USD per pair and MAX_PORTFOLIO_SIZE_USD overall,
+skipping any whose continuous daily rate (at the size taken) is below MIN_RATE_PER_DAY or whose margin
+(profit / (cost + fees)) is above MAX_MARGIN (too good to be real: usually a book flicker that's gone
+before our order lands). Kalshi goes first and its leg is stored as a position straight away; Polymarket
+is then bought for what Kalshi filled, with its limit as high as keeps the position at MIN_RATE_PER_DAY
+(its book may have moved during the Kalshi round trip). A pair isn't entered again within ENTRY_COOLDOWN_SECONDS of an attempt,
 and what our fills took is subtracted from the books until they update (TakenBooks), so the same
 liquidity isn't chased twice.
 
@@ -37,7 +39,7 @@ import asyncio
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import ROUND_FLOOR, Decimal
 
@@ -50,7 +52,7 @@ from opportunities.engine import OpportunityEngine
 from opportunities.evaluate import Opportunity, Pair, best_opportunity, daily_rate, days_until
 from opportunities.fees import kalshi_fee, polymarket_fee
 from trades.kalshi import KalshiClient
-from trades.orders import Fill, OrderRequest
+from trades.orders import Fill, OrderRequest, failed
 from trades.paper import PaperClient
 from trades.polymarket import PolymarketClient
 from trades.taken import TakenBooks
@@ -60,6 +62,7 @@ ledger = logging.getLogger("trades.ledger")  # main.py also writes this one to T
 
 ZERO = Decimal(0)
 TICK = Decimal("0.01")
+NO_FILL = Fill("killed", Decimal(0), None, Decimal(0))
 
 
 @dataclass
@@ -197,18 +200,28 @@ class TradeEngine:
             _tag(), pair.pair_id, sized.qty, sized.cost, sized.fees, sized.profit, sized.rate_per_day * 100,
         )
         self._last_entry[pair.pair_id] = time.monotonic()
+        k_req, p_req = reqs
         # Kalshi first: a killed Kalshi order leaves us flat instead of holding a Polymarket leg to unwind.
-        (k_fill,) = await self._place(reqs[:1])
+        (k_fill,) = await self._place([k_req])
         if k_fill.qty <= 0:
-            self._record_order(None, pair.pair_id, "entry", reqs[0], k_fill)
+            self._record_order(None, pair.pair_id, "entry", k_req, k_fill)
             self._halt_if_unknown(k_fill)
             return
-        (p_fill,) = await self._place(reqs[1:])
-        pos = self._open_position(pair, (reqs[0].side, reqs[1].side), k_fill, p_fill, now)
-        for req, fill in zip(reqs, (k_fill, p_fill)):
-            self._record_order(pos.position_id, pair.pair_id, "entry", req, fill)
-        if self._halt_if_unknown(k_fill, p_fill):
+        # Store the Kalshi leg before sending Polymarket, so it's tracked whatever happens next.
+        pos = self._open_position(pair, (k_req.side, p_req.side), k_fill, NO_FILL, now)
+        self._record_order(pos.position_id, pair.pair_id, "entry", k_req, k_fill)
+        p_req = replace(p_req, qty=k_fill.qty, limit_price=self._entry_hedge_limit(pos, p_req.limit_price))
+        (p_fill,) = await self._place([p_req])
+        self._record_order(pos.position_id, pair.pair_id, "entry", p_req, p_fill)
+        if self._halt_if_unknown(p_fill):
             return
+        if p_fill.qty > 0:
+            pos.poly_qty += p_fill.qty
+            pos.cost += _notional(p_fill)
+            pos.fees += p_fill.fee
+        if pos.kalshi_qty == pos.poly_qty:
+            pos.status, pos.close_reason = "open", None
+        self._save(pos)
         if pos.status == "open":
             log.info(
                 "%sPOSITION %d opened: pair %d, %s contracts, cost $%.2f fees $%.2f",
@@ -250,7 +263,7 @@ class TradeEngine:
             sized = best_opportunity(pair, k_book, p_book, now, max_qty=qty, sides=sides)
             if sized is None or sized.qty != qty:
                 return None
-        if not config.MIN_RATE_PER_DAY <= sized.rate_per_day <= config.MAX_RATE_PER_DAY:
+        if sized.rate_per_day < config.MIN_RATE_PER_DAY or sized.profit > config.MAX_MARGIN * (sized.cost + sized.fees):
             return None
         # Limit at the prices the full opportunity reaches (2x the depth we need), unless filling all of
         # it at those prices would lose money; then limit at what this size needs.
@@ -262,6 +275,20 @@ class TradeEngine:
             OrderRequest("polymarket", pair.poly_slug, sides[1], "buy", qty, p_limit, "fok"),
         ]
         return pair, sized, reqs, now
+
+    def _entry_hedge_limit(self, pos: Position, limit: Decimal) -> Decimal:
+        """Raise the planned Polymarket limit as far as keeps the position at MIN_RATE_PER_DAY if all the
+        missing contracts fill there, the worst case."""
+        need = pos.kalshi_qty - pos.poly_qty
+        days = days_until(pos.resolution_date, datetime.now(timezone.utc))
+
+        def worth_it(price: Decimal) -> bool:
+            initial = pos.cost + pos.fees + price * need + polymarket_fee([(price, need)])
+            return daily_rate(pos.qty, initial, days) >= config.MIN_RATE_PER_DAY
+
+        while limit + TICK < 1 and worth_it(limit + TICK):
+            limit += TICK
+        return limit
 
     async def _repair_hedge(self, pos: Position) -> bool:
         """Buy the missing contracts on the short leg of a one-legged entry, retrying for HEDGE_RETRY_SECONDS,
@@ -435,21 +462,26 @@ class TradeEngine:
         return k_fills, p_fills, proceeds - exit_fees
 
     async def _sell(self, pos: Position, k_fills: list[Level], p_fills: list[Level]) -> None:
-        """Sell both legs of a position at once (FOK) down to the quoted prices; a one-legged result is unwound."""
-        reqs = [
-            OrderRequest("kalshi", pos.kalshi_market_id, pos.kalshi_side, "sell", pos.qty, k_fills[-1][0], "fok"),
-            OrderRequest("polymarket", pos.poly_slug, pos.poly_side, "sell", pos.qty, p_fills[-1][0], "fok"),
-        ]
-        fills = await self._place(reqs)
-        for req, fill in zip(reqs, fills):
-            self._record_order(pos.position_id, pos.pair_id, "cashout", req, fill)
-            self._apply_sale(pos, req.venue, fill)
-        if self._halt_if_unknown(*fills):
+        """Sell both legs of a position (FOK) down to the quoted prices, Kalshi first and Polymarket for what
+        Kalshi sold; a one-legged result is unwound."""
+        k_req = OrderRequest("kalshi", pos.kalshi_market_id, pos.kalshi_side, "sell", pos.qty, k_fills[-1][0], "fok")
+        (k_fill,) = await self._place([k_req])
+        self._record_order(pos.position_id, pos.pair_id, "cashout", k_req, k_fill)
+        if self._halt_if_unknown(k_fill) or k_fill.qty <= 0:
+            return  # nothing sold (or we don't know): the position is as it was
+        self._apply_sale(pos, "kalshi", k_fill)
+        p_req = OrderRequest("polymarket", pos.poly_slug, pos.poly_side, "sell", k_fill.qty, p_fills[-1][0], "fok")
+        (p_fill,) = await self._place([p_req])
+        self._record_order(pos.position_id, pos.pair_id, "cashout", p_req, p_fill)
+        self._apply_sale(pos, "polymarket", p_fill)
+        if self._halt_if_unknown(p_fill):
             self._save(pos)
             return
         if pos.kalshi_qty <= 0 and pos.poly_qty <= 0:
             self._close(pos, "cashout")
-        elif pos.kalshi_qty != pos.poly_qty:
+        elif pos.kalshi_qty == pos.poly_qty:
+            self._save(pos)
+        else:
             # One leg sold and the other didn't: we're exposed, so sell the rest right away.
             pos.status, pos.close_reason = "unhedged", "cashout"
             self._save(pos)
@@ -589,11 +621,19 @@ class TradeEngine:
 
     async def _place(self, reqs: list[OrderRequest]) -> list[Fill]:
         """Send the orders at once. Live fills are recorded as taken from the books (paper fills record themselves)."""
-        fills = await asyncio.gather(*(self._clients[r.venue].place(r) for r in reqs))
+        fills = await asyncio.gather(*(self._place_one(r) for r in reqs))
         if not config.DRY_RUN:
             for req, fill in zip(reqs, fills):
                 self._books[req.venue].take(req, fill.qty)
         return list(fills)
+
+    async def _place_one(self, req: OrderRequest) -> Fill:
+        """A client error we didn't foresee leaves the order's outcome unknown, which halts trading."""
+        try:
+            return await self._clients[req.venue].place(req)
+        except Exception as e:
+            log.exception("ORDER %s %s %s %s crashed", req.action, req.venue, req.market_id, req.side)
+            return failed("unknown", repr(e))
 
     def _book(self, venue: str, market_id: str) -> Book | None:
         """Live book minus what our fills have taken since it last changed."""
