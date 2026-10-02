@@ -1,9 +1,10 @@
 """Trades engine: enters arbs, sells one-legged fills straight away, and cashes out when that beats holding.
 
 Entry. For each opportunity (best daily rate first) it buys half the contracts available at the prices
-it wants, both legs at once (asyncio.gather) as fill-or-kill orders, within MAX_TRADE_SIZE_USD per
-pair and MAX_PORTFOLIO_SIZE_USD overall, skipping any whose compound daily rate (at the size taken) is
-below MIN_COMPOUND_RATE_PER_DAY. A pair isn't entered again within ENTRY_COOLDOWN_SECONDS of an attempt,
+it wants as fill-or-kill orders, Kalshi first and Polymarket only once Kalshi has filled, within
+MAX_TRADE_SIZE_USD per pair and MAX_PORTFOLIO_SIZE_USD overall, skipping any whose continuous daily rate
+(at the size taken) is below MIN_RATE_PER_DAY or above MAX_RATE_PER_DAY (too good to
+be real: usually a book flicker that's gone before our order lands). A pair isn't entered again within ENTRY_COOLDOWN_SECONDS of an attempt,
 and what our fills took is subtracted from the books until they update (TakenBooks), so the same
 liquidity isn't chased twice.
 
@@ -13,13 +14,13 @@ doesn't work, the filled leg is sold.
 
 Cashout (STANDARD_CASHOUT). An open position is sold when selling now earns a better daily rate than holding:
 
-    (payout / initial) ^ (1 / days_held) - 1  >  (final / initial) ^ (1 / days_total) - 1
+    ln(payout / initial) / days_held  >  ln(final / initial) / days_total
 
 payout = what both legs sell for into the current bids, after fees; initial = entry cost + fees;
 final = contracts (each pays $1); days_held and days_total (entry to resolution) floored at RATE_MIN_DAYS.
 
 Conditional cashout (CONDITIONAL_CASHOUT). When the portfolio cap stops an opportunity getting its full
-size, the open position with the lowest forward rate, (final / payout) ^ (1 / days_left) - 1, is sold to
+size, the open position with the lowest forward rate, ln(final / payout) / days_left, is sold to
 make room, if selling realizes a profit (payout > initial) and the opportunity beats it in both daily
 rate and dollars per day.
 
@@ -174,7 +175,7 @@ class TradeEngine:
             for pos in [p for p in self._positions.values() if p.status == "open"]:
                 await self._maybe_cash_out(pos)
         for opp in opportunities:
-            if self.halted or opp.rate_per_day < config.MIN_COMPOUND_RATE_PER_DAY:
+            if self.halted or opp.rate_per_day < config.MIN_RATE_PER_DAY:
                 return  # ranked best rate first, so the rest are below the minimum too
             await self._enter(opp)
             if config.CONDITIONAL_CASHOUT and not self.halted:
@@ -196,12 +197,13 @@ class TradeEngine:
             _tag(), pair.pair_id, sized.qty, sized.cost, sized.fees, sized.profit, sized.rate_per_day * 100,
         )
         self._last_entry[pair.pair_id] = time.monotonic()
-        k_fill, p_fill = await self._place(reqs)
-        if k_fill.qty <= 0 and p_fill.qty <= 0:
-            for req, fill in zip(reqs, (k_fill, p_fill)):
-                self._record_order(None, pair.pair_id, "entry", req, fill)
-            self._halt_if_unknown(k_fill, p_fill)
+        # Kalshi first: a killed Kalshi order leaves us flat instead of holding a Polymarket leg to unwind.
+        (k_fill,) = await self._place(reqs[:1])
+        if k_fill.qty <= 0:
+            self._record_order(None, pair.pair_id, "entry", reqs[0], k_fill)
+            self._halt_if_unknown(k_fill)
             return
+        (p_fill,) = await self._place(reqs[1:])
         pos = self._open_position(pair, (reqs[0].side, reqs[1].side), k_fill, p_fill, now)
         for req, fill in zip(reqs, (k_fill, p_fill)):
             self._record_order(pos.position_id, pair.pair_id, "entry", req, fill)
@@ -248,7 +250,7 @@ class TradeEngine:
             sized = best_opportunity(pair, k_book, p_book, now, max_qty=qty, sides=sides)
             if sized is None or sized.qty != qty:
                 return None
-        if sized.rate_per_day < config.MIN_COMPOUND_RATE_PER_DAY:
+        if not config.MIN_RATE_PER_DAY <= sized.rate_per_day <= config.MAX_RATE_PER_DAY:
             return None
         # Limit at the prices the full opportunity reaches (2x the depth we need), unless filling all of
         # it at those prices would lose money; then limit at what this size needs.

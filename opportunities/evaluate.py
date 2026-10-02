@@ -7,6 +7,7 @@ cost less than $1. Which sides to buy depends on `flipped`:
     flipped=1 (Kalshi YES == Poly NO):  Kalshi YES + Poly YES, or Kalshi NO + Poly NO
 """
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_FLOOR, Decimal
@@ -54,7 +55,7 @@ class Opportunity:
     fees: Decimal
     profit: Decimal  # qty - cost - fees
     days: float  # to resolution, floored at RATE_MIN_DAYS
-    rate_per_day: float  # (final / initial) ** (1 / days) - 1, with final = qty and initial = cost + fees
+    rate_per_day: float  # ln(final / initial) / days, with final = qty and initial = cost + fees
 
     @property
     def key(self) -> tuple[int, str, str]:
@@ -89,8 +90,10 @@ def days_until(when: datetime, now: datetime) -> float:
 
 
 def daily_rate(final: Decimal, initial: Decimal, days: float) -> float:
-    """(final / initial) ** (1 / days) - 1: the compound daily return of turning `initial` into `final`."""
-    return float(final / initial) ** (1 / days) - 1 if initial > 0 else 0.0
+    """ln(final / initial) / days: the continuous daily return of turning `initial` into `final`."""
+    if initial <= 0:
+        return 0.0
+    return math.log(final / initial) / days if final > 0 else -math.inf
 
 
 def _evaluate(pair, k_side, k_asks: list[Level], p_side, p_asks: list[Level], days, max_qty, max_cost):

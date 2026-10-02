@@ -81,9 +81,10 @@ RATE_MIN_DAYS = 1  # days (to resolution, or held) are floored at this when comp
 
 # Trades engine
 DRY_RUN = False  # simulate fills against the live books instead of sending orders; set False to trade for real
-MAX_TRADE_SIZE_USD = Decimal("5")  # most contract cost (both legs, before fees) in open positions on one pair
-MAX_PORTFOLIO_SIZE_USD = Decimal("20")  # most contract cost in open positions across all pairs
-MIN_COMPOUND_RATE_PER_DAY = 0.001  # 0.1%/day: opportunities with a lower compound daily rate aren't entered
+MAX_TRADE_SIZE_USD = Decimal("20")  # most contract cost (both legs, before fees) in open positions on one pair
+MAX_PORTFOLIO_SIZE_USD = Decimal("100")  # most contract cost in open positions across all pairs
+MIN_RATE_PER_DAY = 0.001  # 0.1%/day: opportunities with a lower continuous daily rate, ln(final / initial) / days, aren't entered
+MAX_RATE_PER_DAY = 0.005  # 0.5%/day: opportunities with a higher continuous daily rate aren't entered (likely a phantom price)
 STANDARD_CASHOUT = True  # sell an open position when selling now earns a better daily rate than holding to resolution
 CONDITIONAL_CASHOUT = True  # when the portfolio is full, sell the position with the lowest forward rate for a better opportunity
 ENTRY_COOLDOWN_SECONDS = 2  # after an entry attempt on a pair, don't try that pair again for this long (books catch up)

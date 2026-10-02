@@ -178,7 +178,7 @@ Kalshi's book only has bids, so a YES ask at `p` is a NO bid at `1 - p`. Polymar
 - Kalshi: `0.07 × fee_multiplier × contracts × p × (1 − p)`, rounded up to the cent, per price level.
 - Polymarket US: `0.0695 × contracts × p × (1 − p)`, banker's rounding to the cent ([schedule effective 2026-10-01](https://docs.polymarket.us/fees)). Volume rebates aren't counted.
 
-**Ranking.** Opportunities are ranked by daily rate, `(final / initial) ^ (1 / days) − 1`. `final` is the payout (contracts × $1), `initial` is contract cost plus fees, and `days` is time until the later of the two markets' resolution dates, floored at `RATE_MIN_DAYS` (1). Kalshi's 2099 placeholder dates therefore rank near zero.
+**Ranking.** Opportunities are ranked by continuous daily rate, `ln(final / initial) / days`, the quantity we want to maximize. `final` is the payout (contracts × $1), `initial` is contract cost plus fees, and `days` is time until the later of the two markets' resolution dates, floored at `RATE_MIN_DAYS` (1). Kalshi's 2099 placeholder dates therefore rank near zero.
 
 **Output.** Each opportunity is logged once when it opens (`OPEN pair …` with legs, limit prices, size, cost, fees, profit and daily rate) and once when it closes (`CLOSED pair …` with how long it lasted and its peak profit). `trading_cycle()` gets the ranked list for the execution engine.
 
@@ -191,7 +191,7 @@ The engine logs every profitable opportunity at its full depth. The trades engin
 Each trading cycle, after the opportunity engine has re-evaluated changed pairs, the trades engine:
 1. retries selling any one-legged (`unhedged`) position,
 2. checks every open position for a cashout (if `STANDARD_CASHOUT`),
-3. walks the opportunities, best daily rate first, and enters what fits, stopping at the first one below `MIN_COMPOUND_RATE_PER_DAY`. If the portfolio cap is what stops one getting its full size, it may swap out a weaker position for it (if `CONDITIONAL_CASHOUT`).
+3. walks the opportunities, best daily rate first, and enters what fits, stopping at the first one below `MIN_RATE_PER_DAY` and skipping any above `MAX_RATE_PER_DAY`. If the portfolio cap is what stops one getting its full size, it may swap out a weaker position for it (if `CONDITIONAL_CASHOUT`).
 
 With `DRY_RUN = True` nothing is sent. `trades/paper.py` fills each order against the live websocket books. Paper positions are stored with `dry_run = 1` and are kept separate from live ones.
 
@@ -206,7 +206,8 @@ With `DRY_RUN = True` nothing is sent. `trades/paper.py` fills each order agains
 | `DRY_RUN` | `True`: simulate fills. `False`: send real orders |
 | `MAX_TRADE_SIZE_USD` | most contract cost (both legs, before fees) in open positions on **one pair**, summed across repeat entries |
 | `MAX_PORTFOLIO_SIZE_USD` | most contract cost in open positions across all pairs. Each venue needs its own share of this in cash; the engine doesn't check balances |
-| `MIN_COMPOUND_RATE_PER_DAY` | lowest compound daily rate, `(final / initial) ^ (1 / days) − 1`, worth entering (0.001 = 0.1%/day). Checked at the size actually taken. The opportunity engine still logs everything below it |
+| `MIN_RATE_PER_DAY` | lowest continuous daily rate, `ln(final / initial) / days`, worth entering (0.001 = 0.1%/day). Checked at the size actually taken. The opportunity engine still logs everything below it |
+| `MAX_RATE_PER_DAY` | highest continuous daily rate worth entering (0.005 = 0.5%/day). Anything better is usually a price that flickers onto a book and is gone before our order lands. Checked at the size actually taken |
 | `STANDARD_CASHOUT` | sell a position when cashing out beats holding (see Cashout) |
 | `CONDITIONAL_CASHOUT` | when the portfolio is full, swap the weakest position for a better opportunity (see Conditional cashout) |
 | `ENTRY_COOLDOWN_SECONDS` | after an entry attempt on a pair, don't enter it again for this long (2s), while the books catch up |
@@ -217,7 +218,7 @@ With `DRY_RUN = True` nothing is sent. `trades/paper.py` fills each order agains
 ### Entry
 - **Size.** Half the contracts available at profitable prices (the full opportunity's depth), rounded down to whole contracts. It's also capped by whatever room is left under both limits, so a pair that shows up again only tops up to `MAX_TRADE_SIZE_USD`.
 - **Prices.** Each leg's limit is the worst price the full opportunity reaches, so there's twice the depth needed at or below it. If filling everything at those limits would lose money, the limits drop to the prices the smaller size needs.
-- **Orders.** Both legs are sent at once with `asyncio.gather` as fill-or-kill orders.
+- **Orders.** Both legs are fill-or-kill. Kalshi goes first; Polymarket is sent only once Kalshi has filled, so a killed Kalshi order (the usual failure: its book shows liquidity that's already gone) leaves us flat instead of holding a Polymarket leg to sell at a loss.
 - **Cooldown.** A pair isn't entered again within `ENTRY_COOLDOWN_SECONDS` of an attempt. Together with the taken-liquidity tracking this stops a second entry on a book that doesn't show our first fill yet.
 - **One leg fills, the other is killed:** the missing leg is retried (fill-or-kill) every `HEDGE_RETRY_INTERVAL_SECONDS` for up to `HEDGE_RETRY_SECONDS`, at any price that keeps the whole position at break-even or better (cost + fees ≤ $1 per contract). The limit is set as high as break-even allows, in case the book moved a tick. If the hedge completes the position is `open` as usual (logged `POSITION … hedged`, orders stored with purpose `entry`). Otherwise the filled leg is sold into the bids (immediate-or-cancel), and the position is closed with reason `unwind`. If the bids can't absorb everything, the rest is retried every cycle.
 - **An order's result is unknown** (timeout, network error, 5xx): trading halts with a `CRITICAL` log line until restart, because the order may or may not have filled. Check both venues by hand before restarting.
@@ -226,7 +227,7 @@ With `DRY_RUN = True` nothing is sent. `trades/paper.py` fills each order agains
 An open position is sold when selling now earns a better daily rate than holding to resolution:
 
 ```
-(payout / initial) ^ (1 / days_held) − 1  >  (final / initial) ^ (1 / days_total) − 1
+ln(payout / initial) / days_held  >  ln(final / initial) / days_total
 ```
 
 - `payout`: what both legs fetch selling the whole position into the current bids, after fees
@@ -243,7 +244,7 @@ Both legs are sold at once as fill-or-kill orders. If only one sells, the other 
 When an opportunity can't get its full size because the portfolio is at `MAX_PORTFOLIO_SIZE_USD`, the engine considers selling an open position to make room. It picks the position with the lowest **forward rate**, which is what holding it from now to resolution earns on the money you'd get by selling it now:
 
 ```
-(final / payout) ^ (1 / days_left) − 1
+ln(final / payout) / days_left
 ```
 
 The entry rate doesn't matter here. That money is already spent. The real choice is between leaving `payout` in this position or moving it into the new trade, and the forward rate is what staying put earns. A position whose prices have moved in your favour has a low forward rate: most of its profit is already in the bid, so it's the cheapest money to free up.
