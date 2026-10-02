@@ -1,4 +1,4 @@
-"""Settings for the polshi politics arb bot."""
+"""Settings for the polshi-politics bot."""
 
 import os
 from decimal import Decimal
