@@ -2,8 +2,8 @@
 
 Every REFRESH_INTERVAL_SECONDS it refreshes markets (both venues) and then matchings; the rest
 of the time it runs trading cycles back to back: find opportunities, then cash out, unwind and enter
-trades. Trading never runs during a refresh. The websocket order book feeds run in the background
-the whole time.
+trades. Trading never runs during a refresh. The websocket order book feeds and a status heartbeat
+run in the background the whole time.
 """
 
 import asyncio
@@ -68,6 +68,21 @@ async def trading_cycle(engine: OpportunityEngine, trader: TradeEngine, timeout:
     await trader.cycle(opportunities)
 
 
+async def heartbeat(engine: OpportunityEngine, trader: TradeEngine) -> None:
+    """Log one status line every HEARTBEAT_INTERVAL_SECONDS, with book updates and cycles since the last one."""
+    last_updates = engine.kalshi.updates + engine.poly.updates
+    last_cycles = engine.cycles
+    while True:
+        await asyncio.sleep(config.HEARTBEAT_INTERVAL_SECONDS)
+        updates = engine.kalshi.updates + engine.poly.updates
+        log.info(
+            "HEARTBEAT %s | %s | %d book updates, %d cycles in %ds",
+            engine.status(), trader.status(), updates - last_updates, engine.cycles - last_cycles,
+            config.HEARTBEAT_INTERVAL_SECONDS,
+        )
+        last_updates, last_cycles = updates, engine.cycles
+
+
 async def main() -> None:
     setup_logging()
     markets_conn = markets_db.connect(config.MARKETS_DB_PATH)
@@ -78,6 +93,7 @@ async def main() -> None:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         trader = TradeEngine(trades_conn, engine, session)
         feeds = engine.start(session)  # noqa: F841 (keeps a reference so the tasks aren't collected)
+        pulse = asyncio.create_task(heartbeat(engine, trader))  # noqa: F841
         last_refresh = None
         while True:
             until_refresh = 0 if last_refresh is None else last_refresh + config.REFRESH_INTERVAL_SECONDS - time.monotonic()

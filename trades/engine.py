@@ -93,6 +93,15 @@ class TradeEngine:
 
     # ---- called by main ----
 
+    def status(self) -> str:
+        """Positions and exposure, for the heartbeat."""
+        unhedged = sum(p.status == "unhedged" for p in self._positions.values())
+        return (
+            f"{len(self._positions)} positions ({unhedged} unhedged), "
+            f"${self._exposure():.2f} of ${config.MAX_PORTFOLIO_SIZE_USD:.2f} deployed"
+            + (", HALTED" if self.halted else "")
+        )
+
     def held_markets(self) -> dict[str, set[str]]:
         """Markets with an open position, so the feeds keep streaming them even if the pair stops being verified."""
         held = {"kalshi": set(), "polymarket": set()}

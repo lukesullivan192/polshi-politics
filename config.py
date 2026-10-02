@@ -12,6 +12,7 @@ load_dotenv(ROOT / ".env")
 # Main loop
 REFRESH_INTERVAL_SECONDS = 10 * 60  # how often to refresh markets + matchings
 TRADING_LOOP_DELAY_SECONDS = 0  # pause between trading cycles
+HEARTBEAT_INTERVAL_SECONDS = 60  # how often to log a one-line status, so a quiet bot is visibly alive
 
 # Storage
 MARKETS_DB_PATH = ROOT / "data" / "markets" / "markets.db"

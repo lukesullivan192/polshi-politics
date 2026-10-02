@@ -29,6 +29,7 @@ class OpportunityEngine:
         self._dirty: set[int] = set()  # pairs to re-evaluate
         self._changed = asyncio.Event()
         self._open: dict[int, tuple[Opportunity, float, Decimal]] = {}  # pair_id -> (latest, opened at, peak profit)
+        self.cycles = 0  # since start, for the heartbeat
 
     @property
     def pairs(self) -> dict[int, Pair]:
@@ -90,6 +91,7 @@ class OpportunityEngine:
         except asyncio.TimeoutError:
             pass
         self._changed.clear()
+        self.cycles += 1
         dirty, self._dirty = self._dirty, set()
         now = datetime.now(timezone.utc)
         for pair_id in dirty:
@@ -109,6 +111,17 @@ class OpportunityEngine:
                 self._open[pair_id] = (opp, time.monotonic(), opp.profit)
                 log.info("OPEN %s", describe(opp))
         return sorted((o for o, _, _ in self._open.values()), key=lambda o: o.rate_per_day, reverse=True)
+
+    def status(self) -> str:
+        """Pairs, live books per venue and open opportunities, for the heartbeat."""
+        books = ", ".join(
+            f"{feed.venue} {len(feed.market_ids())}/{feed.tracked()} books" for feed in (self.kalshi, self.poly)
+        )
+        best = max((o.rate_per_day for o, _, _ in self._open.values()), default=None)
+        return (
+            f"{len(self._pairs)} pairs, {books}, {len(self._open)} open opportunities"
+            + (f" (best {best:.4%}/day)" if best is not None else "")
+        )
 
     def _on_update(self, venue: str, market_id: str) -> None:
         pair_ids = self._pairs_by_market.get((venue, market_id))

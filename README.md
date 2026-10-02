@@ -38,6 +38,14 @@ venv/bin/python main.py
 
 One loop handles everything. Every `REFRESH_INTERVAL_SECONDS` (10 minutes) it refreshes markets, then matchings, settles positions whose markets are gone, then points the order book feeds at the verified pairs and any markets with open positions; the rest of the time it runs trading cycles back to back, `TRADING_LOOP_DELAY_SECONDS` (0) apart. A trading cycle waits for a book change, so an idle market doesn't spin the CPU. Trading never runs during a refresh; the feeds keep streaming in the background. Logs go to `logs/polshi.log` and the console. Stop with Ctrl+C.
 
+Besides event lines (opportunities opening and closing, orders, positions), it logs a `HEARTBEAT` line every `HEARTBEAT_INTERVAL_SECONDS` (60), so a quiet stretch doesn't look like a hang:
+
+```
+HEARTBEAT 146 pairs, kalshi 146/146 books, polymarket 143/143 books, 17 open opportunities (best 0.0141%/day) | 20 positions (0 unhedged), $999.08 of $1000.00 deployed | 812 book updates, 455 cycles in 60s
+```
+
+`books` is live books out of markets subscribed. `book updates` and `cycles` count since the previous heartbeat; if both are 0 the feeds have stalled.
+
 Review pairs by hand (safe to run while the bot is running):
 
 ```bash

@@ -27,6 +27,7 @@ class BookFeed:
         self._markets_changed = asyncio.Event()
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self.versions: dict[str, int] = {}  # market_id -> bumped on every book change
+        self.updates = 0  # book changes since start, for the heartbeat
         self._closing: asyncio.Task | None = None
 
     # Implemented by each venue.
@@ -87,7 +88,11 @@ class BookFeed:
             await asyncio.sleep(delay)
             delay = min(delay * 2, config.WS_RECONNECT_MAX_DELAY_SECONDS)
 
+    def tracked(self) -> int:
+        return len(self._markets)
+
     def _notify(self, market_id: str) -> None:
+        self.updates += 1
         self.versions[market_id] = self.versions.get(market_id, 0) + 1
         self._on_update(self.venue, market_id)
 
