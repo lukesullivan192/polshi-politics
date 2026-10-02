@@ -29,6 +29,14 @@ class KalshiClient:
         self._url = f"{config.KALSHI_BASE_URL}/portfolio/events/orders"
         self._path = urlparse(self._url).path
 
+    async def balance(self) -> Decimal:
+        """Cash in the account, in dollars (positions not included)."""
+        url = f"{config.KALSHI_BASE_URL}/portfolio/balance"
+        async with self._session.get(url, headers=auth.kalshi_headers("GET", urlparse(url).path)) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+        return Decimal(data["balance_dollars"])
+
     async def place(self, req: OrderRequest) -> Fill:
         yes_price = req.limit_price if req.side == "yes" else 1 - req.limit_price
         body = {

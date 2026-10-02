@@ -3,7 +3,13 @@
 Entry. For each opportunity (best daily rate first) it buys half the contracts available at the prices
 it wants, both legs at once (asyncio.gather) as fill-or-kill orders, within MAX_TRADE_SIZE_USD per
 pair and MAX_PORTFOLIO_SIZE_USD overall, skipping any whose compound daily rate (at the size taken) is
-below MIN_COMPOUND_RATE_PER_DAY. If only one leg fills, that leg is sold right away.
+below MIN_COMPOUND_RATE_PER_DAY. A pair isn't entered again within ENTRY_COOLDOWN_SECONDS of an attempt,
+and what our fills took is subtracted from the books until they update (TakenBooks), so the same
+liquidity isn't chased twice.
+
+Hedge repair. If only one leg fills, the missing leg is retried for up to HEDGE_RETRY_SECONDS at any
+price that keeps the whole position at break-even or better (cost + fees <= $1 per contract). If that
+doesn't work, the filled leg is sold.
 
 Cashout (STANDARD_CASHOUT). An open position is sold when selling now earns a better daily rate than holding:
 
@@ -19,11 +25,17 @@ rate and dollars per day.
 
 Every order is written to the trades DB and the log. With DRY_RUN on, orders are filled by PaperClient
 against the live books and nothing is sent.
+
+Trades log (TRADES_LOG_PATH). Every position change (opened, one-legged, hedged, closed) gets a line, followed
+by a portfolio line: value at startup, value now, value once open positions resolve, and the expected
+annualized return. Value = cash + open positions at cost; cash is read from both venues at startup (in a
+dry run it starts at MAX_PORTFOLIO_SIZE_USD) and then moved by our own fills and settlements.
 """
 
 import asyncio
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_FLOOR, Decimal
@@ -40,10 +52,13 @@ from trades.kalshi import KalshiClient
 from trades.orders import Fill, OrderRequest
 from trades.paper import PaperClient
 from trades.polymarket import PolymarketClient
+from trades.taken import TakenBooks
 
 log = logging.getLogger(__name__)
+ledger = logging.getLogger("trades.ledger")  # main.py also writes this one to TRADES_LOG_PATH
 
 ZERO = Decimal(0)
+TICK = Decimal("0.01")
 
 
 @dataclass
@@ -81,22 +96,43 @@ class TradeEngine:
     def __init__(self, conn: sqlite3.Connection, opportunities: OpportunityEngine, session: aiohttp.ClientSession):
         self._conn = conn
         self._opps = opportunities
-        self._feeds = {"kalshi": opportunities.kalshi, "polymarket": opportunities.poly}
+        self._books = {"kalshi": TakenBooks(opportunities.kalshi), "polymarket": TakenBooks(opportunities.poly)}
         if config.DRY_RUN:
             self._clients = {
-                "kalshi": PaperClient(opportunities.kalshi, self._kalshi_fee),
-                "polymarket": PaperClient(opportunities.poly, lambda market_id, fills: polymarket_fee(fills)),
+                "kalshi": PaperClient(self._books["kalshi"], self._kalshi_fee),
+                "polymarket": PaperClient(self._books["polymarket"], lambda market_id, fills: polymarket_fee(fills)),
             }
         else:
             self._clients = {"kalshi": KalshiClient(session), "polymarket": PolymarketClient(session)}
         self.halted = False
+        self._last_entry: dict[int, float] = {}  # pair_id -> monotonic time of the last entry attempt
         self._positions = {p.position_id: p for p in self._load_positions()}
+        self._cash: Decimal | None = None  # across both venues; None if the balances couldn't be read
+        self._initial_value: Decimal | None = None
         log.info(
             "trades engine: %s, %d open positions, $%.2f deployed",
             "DRY RUN" if config.DRY_RUN else "LIVE", len(self._positions), self._exposure(),
         )
 
     # ---- called by main ----
+
+    async def start(self) -> None:
+        """Read the starting cash and write the opening line of the trades log."""
+        if config.DRY_RUN:
+            self._cash = config.MAX_PORTFOLIO_SIZE_USD - sum((_basis(p) for p in self._positions.values()), ZERO)
+        else:
+            try:
+                balances = await asyncio.gather(*(c.balance() for c in self._clients.values()))
+                self._cash = sum(balances, ZERO)
+            except Exception as e:
+                log.error("couldn't read venue balances (%r); the trades log won't show portfolio values", e)
+        if self._cash is not None:
+            self._initial_value = self._cash + sum((_basis(p) for p in self._positions.values()), ZERO)
+        self._ledger(
+            f"{_tag()}START {'DRY RUN' if config.DRY_RUN else 'LIVE'}"
+            + ("" if self._cash is None else f", cash ${self._cash:.2f}")
+            + f", {len(self._positions)} open positions"
+        )
 
     def status(self) -> str:
         """Positions and exposure, for the heartbeat."""
@@ -124,6 +160,8 @@ class TradeEngine:
             if ("kalshi", pos.kalshi_market_id) in live or ("polymarket", pos.poly_slug) in live:
                 continue
             pos.exit_proceeds += pos.qty
+            if self._cash is not None:
+                self._cash += pos.qty
             pos.kalshi_qty = pos.poly_qty = ZERO
             self._close(pos, "settled")
 
@@ -157,7 +195,8 @@ class TradeEngine:
             "%sENTER pair %d: %s contracts, expected cost $%.2f fees $%.2f profit $%.2f, %.4f%%/day",
             _tag(), pair.pair_id, sized.qty, sized.cost, sized.fees, sized.profit, sized.rate_per_day * 100,
         )
-        k_fill, p_fill = await asyncio.gather(*(self._clients[r.venue].place(r) for r in reqs))
+        self._last_entry[pair.pair_id] = time.monotonic()
+        k_fill, p_fill = await self._place(reqs)
         if k_fill.qty <= 0 and p_fill.qty <= 0:
             for req, fill in zip(reqs, (k_fill, p_fill)):
                 self._record_order(None, pair.pair_id, "entry", req, fill)
@@ -173,8 +212,13 @@ class TradeEngine:
                 "%sPOSITION %d opened: pair %d, %s contracts, cost $%.2f fees $%.2f",
                 _tag(), pos.position_id, pair.pair_id, pos.qty, pos.cost, pos.fees,
             )
+            self._ledger(f"{_tag()}OPENED {_describe(pos)}")
         else:
-            log.warning("%sPOSITION %d one-legged (kalshi %s, polymarket %s); selling it", _tag(), pos.position_id, pos.kalshi_qty, pos.poly_qty)
+            log.warning("%sPOSITION %d one-legged (kalshi %s, polymarket %s); retrying the missing leg", _tag(), pos.position_id, pos.kalshi_qty, pos.poly_qty)
+            self._ledger(f"{_tag()}ONE-LEGGED {_describe(pos)}")
+            if await self._repair_hedge(pos) or self.halted:
+                return
+            log.warning("%sPOSITION %d still one-legged; selling it", _tag(), pos.position_id)
             await self._unwind(pos)
 
     def _plan_entry(self, opp: Opportunity, room: Decimal) -> tuple[Pair, Opportunity, list[OrderRequest], datetime] | None:
@@ -182,6 +226,8 @@ class TradeEngine:
         None if there's nothing worth entering."""
         pair = self._opps.pairs.get(opp.pair_id)
         if pair is None or room <= 0:
+            return None
+        if time.monotonic() - self._last_entry.get(pair.pair_id, -config.ENTRY_COOLDOWN_SECONDS) < config.ENTRY_COOLDOWN_SECONDS:
             return None
         k_book = self._book("kalshi", pair.kalshi_market_id)
         p_book = self._book("polymarket", pair.poly_slug)
@@ -214,6 +260,60 @@ class TradeEngine:
             OrderRequest("polymarket", pair.poly_slug, sides[1], "buy", qty, p_limit, "fok"),
         ]
         return pair, sized, reqs, now
+
+    async def _repair_hedge(self, pos: Position) -> bool:
+        """Buy the missing contracts on the short leg of a one-legged entry, retrying for HEDGE_RETRY_SECONDS,
+        at any price that keeps the position at break-even or better. True if the position is now hedged."""
+        deadline = time.monotonic() + config.HEDGE_RETRY_SECONDS
+        while True:
+            short_kalshi = pos.kalshi_qty < pos.poly_qty
+            venue, market_id, side = (
+                ("kalshi", pos.kalshi_market_id, pos.kalshi_side) if short_kalshi
+                else ("polymarket", pos.poly_slug, pos.poly_side)
+            )
+            need = abs(pos.kalshi_qty - pos.poly_qty)
+            book = self._book(venue, market_id)
+            fills = walk(book.asks(side), need) if book else None
+            if fills is not None:
+                fee = kalshi_fee(fills, pos.kalshi_fee_multiplier) if short_kalshi else polymarket_fee(fills)
+                if pos.cost + pos.fees + _total(fills) + fee <= pos.qty:
+                    # Limit as high as break-even allows, in case the book has moved a tick since we saw it.
+                    limit = fills[-1][0]
+                    while limit + TICK < 1 and self._breaks_even(pos, short_kalshi, need, limit + TICK):
+                        limit += TICK
+                    req = OrderRequest(venue, market_id, side, "buy", need, limit, "fok")
+                    (fill,) = await self._place([req])
+                    self._record_order(pos.position_id, pos.pair_id, "entry", req, fill)
+                    if self._halt_if_unknown(fill):
+                        self._save(pos)
+                        return False
+                    if fill.qty > 0:
+                        if short_kalshi:
+                            pos.kalshi_qty += fill.qty
+                        else:
+                            pos.poly_qty += fill.qty
+                        pos.cost += _notional(fill)
+                        pos.fees += fill.fee
+                    if pos.kalshi_qty == pos.poly_qty:
+                        pos.status, pos.close_reason = "open", None
+                        self._save(pos)
+                        log.info(
+                            "%sPOSITION %d hedged: pair %d, %s contracts, cost $%.2f fees $%.2f",
+                            _tag(), pos.position_id, pos.pair_id, pos.qty, pos.cost, pos.fees,
+                        )
+                        self._ledger(f"{_tag()}HEDGED {_describe(pos)}")
+                        return True
+            if time.monotonic() >= deadline:
+                self._save(pos)
+                return False
+            await asyncio.sleep(config.HEDGE_RETRY_INTERVAL_SECONDS)
+
+    def _breaks_even(self, pos: Position, short_kalshi: bool, need: Decimal, limit: Decimal) -> bool:
+        """Whether the position still breaks even if all `need` contracts fill at `limit`, the worst case
+        (price plus fee per contract rises with price)."""
+        worst = [(limit, need)]
+        fee = kalshi_fee(worst, pos.kalshi_fee_multiplier) if short_kalshi else polymarket_fee(worst)
+        return pos.cost + pos.fees + limit * need + fee <= pos.qty
 
     def _profitable_at(self, pair: Pair, qty: Decimal, k_price: Decimal, p_price: Decimal) -> bool:
         cost = qty * (k_price + p_price)
@@ -338,7 +438,7 @@ class TradeEngine:
             OrderRequest("kalshi", pos.kalshi_market_id, pos.kalshi_side, "sell", pos.qty, k_fills[-1][0], "fok"),
             OrderRequest("polymarket", pos.poly_slug, pos.poly_side, "sell", pos.qty, p_fills[-1][0], "fok"),
         ]
-        fills = await asyncio.gather(*(self._clients[r.venue].place(r) for r in reqs))
+        fills = await self._place(reqs)
         for req, fill in zip(reqs, fills):
             self._record_order(pos.position_id, pos.pair_id, "cashout", req, fill)
             self._apply_sale(pos, req.venue, fill)
@@ -371,7 +471,7 @@ class TradeEngine:
             reqs.append(OrderRequest(venue, market_id, side, "sell", held, fills[-1][0], "ioc"))
         if not reqs:
             return
-        fills = await asyncio.gather(*(self._clients[r.venue].place(r) for r in reqs))
+        fills = await self._place(reqs)
         for req, fill in zip(reqs, fills):
             self._record_order(pos.position_id, pos.pair_id, "unwind", req, fill)
             self._apply_sale(pos, req.venue, fill)
@@ -404,14 +504,18 @@ class TradeEngine:
             "%sPOSITION %d closed (%s): cost $%.2f fees $%.2f, exit $%.2f fees $%.2f, profit $%.2f",
             _tag(), pos.position_id, reason, pos.cost, pos.fees, pos.exit_proceeds, pos.exit_fees, profit,
         )
+        self._ledger(
+            f"{_tag()}CLOSED ({reason}) position {pos.position_id} pair {pos.pair_id}: cost ${pos.cost:.2f} fees ${pos.fees:.2f}, "
+            f"exit ${pos.exit_proceeds:.2f} fees ${pos.exit_fees:.2f}, profit ${profit:.2f}"
+        )
 
     def _save(self, pos: Position, profit: Decimal | None = None) -> None:
         with self._conn:
             self._conn.execute(
-                "UPDATE positions SET kalshi_qty = ?, poly_qty = ?, exit_proceeds = ?, exit_fees = ?, status = ?, "
-                "close_reason = ?, profit = ?, closed_at = ? WHERE position_id = ?",
+                "UPDATE positions SET qty = ?, kalshi_qty = ?, poly_qty = ?, cost = ?, fees = ?, exit_proceeds = ?, "
+                "exit_fees = ?, status = ?, close_reason = ?, profit = ?, closed_at = ? WHERE position_id = ?",
                 (
-                    str(pos.kalshi_qty), str(pos.poly_qty), str(pos.exit_proceeds), str(pos.exit_fees), pos.status,
+                    str(pos.qty), str(pos.kalshi_qty), str(pos.poly_qty), str(pos.cost), str(pos.fees), str(pos.exit_proceeds), str(pos.exit_fees), pos.status,
                     pos.close_reason, None if profit is None else str(profit),
                     utc_now_iso() if pos.status == "closed" else None, pos.position_id,
                 ),
@@ -430,6 +534,9 @@ class TradeEngine:
                     fill.exchange_order_id, fill.error, int(config.DRY_RUN), utc_now_iso(),
                 ),
             )
+        if self._cash is not None and fill.qty > 0:
+            sign = -1 if req.action == "buy" else 1
+            self._cash += sign * _notional(fill) - fill.fee
         level = logging.INFO if fill.status in ("filled", "killed") else logging.WARNING
         log.log(
             level,
@@ -440,6 +547,36 @@ class TradeEngine:
             f" ({fill.error})" if fill.error else "",
         )
 
+    def _ledger(self, event: str) -> None:
+        ledger.info(event)
+        ledger.info("    %s", self._portfolio_summary())
+
+    def _portfolio_summary(self) -> str:
+        """Value at startup, now and once open positions resolve, plus the expected annualized return."""
+        if self._cash is None:
+            return "portfolio: unknown (couldn't read venue balances at startup)"
+        positions = list(self._positions.values())
+        hedged = [p for p in positions if p.status == "open"]
+        value = self._cash + sum((_basis(p) for p in positions), ZERO)
+        # One-legged positions are about to be sold; count them at cost.
+        at_resolution = value + sum((p.qty - _basis(p) for p in hedged), ZERO)
+        out = (
+            f"portfolio: start ${self._initial_value:.2f} | now ${value:.2f} ({value - self._initial_value:+.2f}) | "
+            f"at resolution ${at_resolution:.2f} ({at_resolution - self._initial_value:+.2f})"
+        )
+        if not hedged:
+            return out + " | nothing deployed"
+        now = datetime.now(timezone.utc)
+        payout = sum((p.qty for p in hedged), ZERO)
+        deployed = sum((_basis(p) for p in hedged), ZERO)
+        days = sum(float(p.qty) * days_until(p.resolution_date, now) for p in hedged) / float(payout)  # payout-weighted
+        on_portfolio = float(at_resolution / value) ** (365 / days) - 1
+        on_deployed = float(payout / deployed) ** (365 / days) - 1
+        return out + (
+            f" | expected annualized {on_portfolio * 100:.2f}% on the portfolio, {on_deployed * 100:.2f}% on "
+            f"${deployed:.2f} deployed ({len(hedged)} positions, {days:.1f} days to resolution on average)"
+        )
+
     def _halt_if_unknown(self, *fills: Fill) -> bool:
         """An order whose outcome we don't know may or may not have filled: stop trading until a human checks."""
         if any(f.status == "unknown" for f in fills):
@@ -448,10 +585,17 @@ class TradeEngine:
             return True
         return False
 
+    async def _place(self, reqs: list[OrderRequest]) -> list[Fill]:
+        """Send the orders at once. Live fills are recorded as taken from the books (paper fills record themselves)."""
+        fills = await asyncio.gather(*(self._clients[r.venue].place(r) for r in reqs))
+        if not config.DRY_RUN:
+            for req, fill in zip(reqs, fills):
+                self._books[req.venue].take(req, fill.qty)
+        return list(fills)
+
     def _book(self, venue: str, market_id: str) -> Book | None:
-        """Live book; in a dry run, minus what paper fills have already taken."""
-        client = self._clients[venue]
-        return client.book(market_id) if isinstance(client, PaperClient) else self._feeds[venue].book(market_id)
+        """Live book minus what our fills have taken since it last changed."""
+        return self._books[venue].book(market_id)
 
     def _exposure(self, pair_id: int | None = None) -> Decimal:
         return sum(
@@ -499,6 +643,21 @@ class TradeEngine:
             )
             for r in rows
         ]
+
+
+def _basis(pos: Position) -> Decimal:
+    """Net cash a position has taken: entry cost and fees, less anything already sold."""
+    return pos.cost + pos.fees - pos.exit_proceeds + pos.exit_fees
+
+
+def _describe(pos: Position) -> str:
+    out = (
+        f"position {pos.position_id} pair {pos.pair_id}: kalshi {pos.kalshi_market_id} {pos.kalshi_side.upper()} {pos.kalshi_qty} + "
+        f"polymarket {pos.poly_slug} {pos.poly_side.upper()} {pos.poly_qty}, cost ${pos.cost:.2f} fees ${pos.fees:.2f}"
+    )
+    if pos.status != "open":
+        return out
+    return out + f", pays ${pos.qty:.2f} on {pos.resolution_date:%Y-%m-%d} (profit ${pos.qty - pos.cost - pos.fees:.2f})"
 
 
 def _whole(qty: Decimal) -> Decimal:

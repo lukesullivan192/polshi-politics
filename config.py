@@ -19,6 +19,7 @@ MARKETS_DB_PATH = ROOT / "data" / "markets" / "markets.db"
 MATCHINGS_DB_PATH = ROOT / "data" / "matchings" / "matchings.db"
 TRADES_DB_PATH = ROOT / "data" / "trades" / "trades.db"
 LOG_PATH = ROOT / "logs" / "polshi.log"
+TRADES_LOG_PATH = ROOT / "logs" / "trades.log"  # trade events only, each with a portfolio summary
 
 # APIs (public market data, no auth needed)
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
@@ -79,10 +80,13 @@ POLYMARKET_TAKER_FEE_RATE = Decimal("0.0695")  # schedule effective 2026-10-01; 
 RATE_MIN_DAYS = 1  # days (to resolution, or held) are floored at this when computing daily rates
 
 # Trades engine
-DRY_RUN = True  # simulate fills against the live books instead of sending orders; set False to trade for real
-MAX_TRADE_SIZE_USD = Decimal("25")  # most contract cost (both legs, before fees) in open positions on one pair
-MAX_PORTFOLIO_SIZE_USD = Decimal("200")  # most contract cost in open positions across all pairs
+DRY_RUN = False  # simulate fills against the live books instead of sending orders; set False to trade for real
+MAX_TRADE_SIZE_USD = Decimal("5")  # most contract cost (both legs, before fees) in open positions on one pair
+MAX_PORTFOLIO_SIZE_USD = Decimal("20")  # most contract cost in open positions across all pairs
 MIN_COMPOUND_RATE_PER_DAY = 0.001  # 0.1%/day: opportunities with a lower compound daily rate aren't entered
 STANDARD_CASHOUT = True  # sell an open position when selling now earns a better daily rate than holding to resolution
 CONDITIONAL_CASHOUT = True  # when the portfolio is full, sell the position with the lowest forward rate for a better opportunity
+ENTRY_COOLDOWN_SECONDS = 2  # after an entry attempt on a pair, don't try that pair again for this long (books catch up)
+HEDGE_RETRY_SECONDS = 1.0  # when one entry leg fills, keep retrying the other (at break-even or better) this long before selling
+HEDGE_RETRY_INTERVAL_SECONDS = 0.2  # pause between those retries
 ORDER_TIMEOUT_SECONDS = 10  # an order whose result doesn't come back in time halts trading (state unknown)

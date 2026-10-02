@@ -7,7 +7,7 @@ A bot for finding arbitrage between politics and elections markets on [Kalshi](h
 - **Market fetcher**: done. Fetches all open politics and elections markets from both venues into SQLite.
 - **Market matcher**: done. Proposes Kalshi/Polymarket US pairs by fuzzy matching; every pair is verified by hand, and verified pairs are auto-suspended when either side's rules change.
 - **Opportunity engine**: done. Streams order books for every verified pair over both venues' websockets and logs each arb (after fees) when it opens and closes, ranked by daily rate.
-- **Trades engine**: built, running in dry-run mode (`DRY_RUN = True`). Enters arbs, sells one-legged fills, cashes out when that beats holding, and logs every order to `data/trades/trades.db` and the log. Live order placement is written but hasn't been run against the venues yet.
+- **Trades engine**: built and trading live with small limits. Enters arbs, retries the missing leg of a one-legged fill before selling it, cashes out when that beats holding, logs every order to `data/trades/trades.db` and the log, and writes trade events with portfolio value to `logs/trades.log`.
 
 ## Setup
 
@@ -84,13 +84,15 @@ trades/
   engine.py        sizing, entries, one-leg unwinds, cashouts, settlement, DB + log records
   kalshi.py        live Kalshi orders (POST /portfolio/events/orders, V2 YES-book bid/ask)
   polymarket.py    live Polymarket US orders (POST /v1/orders, synchronous execution)
-  paper.py         DRY_RUN client: fills against the live books, remembers what it took
+  paper.py         DRY_RUN client: fills against the live books
+  taken.py         live books minus liquidity our own fills just took, until the books catch up
   orders.py        order request / fill types
   db.py            positions and orders schema
 data/markets/markets.db      created on first run (gitignored)
 data/matchings/matchings.db  created on first run (gitignored)
 data/trades/trades.db        created on first run (gitignored)
 logs/polshi.log              created on first run (gitignored)
+logs/trades.log              trade events with portfolio summaries (gitignored)
 ```
 
 ## Categories
@@ -191,7 +193,11 @@ Each trading cycle, after the opportunity engine has re-evaluated changed pairs,
 2. checks every open position for a cashout (if `STANDARD_CASHOUT`),
 3. walks the opportunities, best daily rate first, and enters what fits, stopping at the first one below `MIN_COMPOUND_RATE_PER_DAY`. If the portfolio cap is what stops one getting its full size, it may swap out a weaker position for it (if `CONDITIONAL_CASHOUT`).
 
-With `DRY_RUN = True` (the default) nothing is sent. `trades/paper.py` fills each order against the live websocket books, and remembers what it took from each market until that market's book next changes. Paper positions are stored with `dry_run = 1` and are kept separate from live ones.
+With `DRY_RUN = True` nothing is sent. `trades/paper.py` fills each order against the live websocket books. Paper positions are stored with `dry_run = 1` and are kept separate from live ones.
+
+**Our own fills.** A venue's websocket book takes a moment to show our fills, and the two venues don't catch up at the same time. `trades/taken.py` remembers what each fill (live or paper) took from a market and subtracts it until that market's book next changes, so the engine doesn't chase the same liquidity again.
+
+**Restarts.** On startup the engine reloads `open` and `unhedged` positions from `trades.db` (for the current `DRY_RUN` mode only). The first loop refreshes markets before any trading, so positions whose markets resolved while the bot was off are settled first.
 
 ### Settings (`config.py`)
 
@@ -203,13 +209,17 @@ With `DRY_RUN = True` (the default) nothing is sent. `trades/paper.py` fills eac
 | `MIN_COMPOUND_RATE_PER_DAY` | lowest compound daily rate, `(final / initial) ^ (1 / days) − 1`, worth entering (0.001 = 0.1%/day). Checked at the size actually taken. The opportunity engine still logs everything below it |
 | `STANDARD_CASHOUT` | sell a position when cashing out beats holding (see Cashout) |
 | `CONDITIONAL_CASHOUT` | when the portfolio is full, swap the weakest position for a better opportunity (see Conditional cashout) |
+| `ENTRY_COOLDOWN_SECONDS` | after an entry attempt on a pair, don't enter it again for this long (2s), while the books catch up |
+| `HEDGE_RETRY_SECONDS` | when one entry leg fills and the other doesn't, keep retrying the missing leg this long (1s) before selling |
+| `HEDGE_RETRY_INTERVAL_SECONDS` | pause between those retries (0.2s) |
 | `ORDER_TIMEOUT_SECONDS` | how long to wait for an order's result before treating it as unknown |
 
 ### Entry
 - **Size.** Half the contracts available at profitable prices (the full opportunity's depth), rounded down to whole contracts. It's also capped by whatever room is left under both limits, so a pair that shows up again only tops up to `MAX_TRADE_SIZE_USD`.
 - **Prices.** Each leg's limit is the worst price the full opportunity reaches, so there's twice the depth needed at or below it. If filling everything at those limits would lose money, the limits drop to the prices the smaller size needs.
 - **Orders.** Both legs are sent at once with `asyncio.gather` as fill-or-kill orders.
-- **One leg fills, the other is killed:** the filled leg is sold straight away into the bids (immediate-or-cancel), and the position is logged and closed with reason `unwind`. If the bids can't absorb everything, the rest is retried every cycle.
+- **Cooldown.** A pair isn't entered again within `ENTRY_COOLDOWN_SECONDS` of an attempt. Together with the taken-liquidity tracking this stops a second entry on a book that doesn't show our first fill yet.
+- **One leg fills, the other is killed:** the missing leg is retried (fill-or-kill) every `HEDGE_RETRY_INTERVAL_SECONDS` for up to `HEDGE_RETRY_SECONDS`, at any price that keeps the whole position at break-even or better (cost + fees ≤ $1 per contract). The limit is set as high as break-even allows, in case the book moved a tick. If the hedge completes the position is `open` as usual (logged `POSITION … hedged`, orders stored with purpose `entry`). Otherwise the filled leg is sold into the bids (immediate-or-cancel), and the position is closed with reason `unwind`. If the bids can't absorb everything, the rest is retried every cycle.
 - **An order's result is unknown** (timeout, network error, 5xx): trading halts with a `CRITICAL` log line until restart, because the order may or may not have filled. Check both venues by hand before restarting.
 
 ### Cashout
@@ -272,7 +282,22 @@ One row per entry. Money is stored as decimal text.
 
 One row per order sent or simulated: `position_id`, `pair_id`, `purpose` (`entry`, `unwind`, `cashout`), `venue`, `market_id`, `side`, `action` (`buy`/`sell`), `tif` (`fok`/`ioc`), `qty_requested`, `limit_price` (price of `side`), `status` (`filled`, `partial`, `killed`, `rejected`, `unknown`), `qty_filled`, `avg_price`, `fee`, `exchange_order_id`, `error`, `dry_run`, `created_at`.
 
-Every order and position change is also logged (`ORDER …`, `ENTER …`, `POSITION … opened/closed`, `CASHOUT …`), with a `[DRY]` prefix in dry runs.
+Every order and position change is also logged (`ORDER …`, `ENTER …`, `POSITION … opened/hedged/closed`, `CASHOUT …`), with a `[DRY]` prefix in dry runs.
+
+### Trades log (`logs/trades.log`)
+
+Only trade events: `START` on launch, then `OPENED`, `ONE-LEGGED`, `HEDGED` and `CLOSED (unwind|cashout|settled)` for every position change. Each event is followed by a portfolio line:
+
+```
+portfolio: start $177.40 | now $177.40 (+0.00) | at resolution $177.65 (+0.25) | expected annualized 2.97% on the portfolio, 69.21% on $9.75 deployed (2 positions, 17.4 days to resolution on average)
+```
+
+- **start**: portfolio value when the bot launched
+- **now**: cash plus open positions at cost (entry cost and fees), so it moves with realized profit and loss, not with the bid
+- **at resolution**: cash plus $1 per contract of every open position, if they're held to resolution
+- **expected annualized**: `(at resolution / now) ^ (365 / days) − 1` on the whole portfolio, and `(payout / cost) ^ (365 / days) − 1` on the deployed money alone. `days` is the payout-weighted average time to resolution (floored at `RATE_MIN_DAYS`)
+
+Cash is read once at startup from both venues (Kalshi `GET /portfolio/balance`, Polymarket US `GET /v1/account/balances` buying power) and is then moved by our own fills and settlements. Trades made by hand on the venues aren't seen until the next restart. In a dry run, cash starts at `MAX_PORTFOLIO_SIZE_USD`, less what open paper positions cost. These lines also go to the main log.
 
 ### Before going live
 - Run in dry-run mode, then check `data/trades/trades.db` and the log.

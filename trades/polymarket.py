@@ -35,6 +35,15 @@ class PolymarketClient:
         self._url = f"{config.POLYMARKET_TRADING_URL}/orders"
         self._path = urlparse(self._url).path
 
+    async def balance(self) -> Decimal:
+        """Cash in the account, in dollars: buying power, which leaves out collateral held against positions."""
+        url = f"{config.POLYMARKET_TRADING_URL}/account/balances"
+        async with self._session.get(url, headers=auth.polymarket_headers("GET", urlparse(url).path)) as resp:
+            resp.raise_for_status()
+            data = await resp.json(content_type=None)
+        usd = [b for b in data["balances"] if b.get("currency") == "USD"]
+        return Decimal(str(usd[0]["buyingPower"])) if usd else Decimal(0)
+
     async def place(self, req: OrderRequest) -> Fill:
         yes_price = req.limit_price if req.side == "yes" else 1 - req.limit_price
         body = {

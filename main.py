@@ -37,6 +37,9 @@ def setup_logging() -> None:
     for handler in (logging.FileHandler(config.LOG_PATH), logging.StreamHandler()):
         handler.setFormatter(fmt)
         root.addHandler(handler)
+    trades = logging.FileHandler(config.TRADES_LOG_PATH)  # trade events also reach the main log
+    trades.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logging.getLogger("trades.ledger").addHandler(trades)
 
 
 async def update_markets(session: aiohttp.ClientSession, conn) -> None:
@@ -92,6 +95,7 @@ async def main() -> None:
     engine = OpportunityEngine()
     async with aiohttp.ClientSession(timeout=timeout) as session:
         trader = TradeEngine(trades_conn, engine, session)
+        await trader.start()
         feeds = engine.start(session)  # noqa: F841 (keeps a reference so the tasks aren't collected)
         pulse = asyncio.create_task(heartbeat(engine, trader))  # noqa: F841
         last_refresh = None
