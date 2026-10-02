@@ -81,4 +81,5 @@ RATE_MIN_DAYS = 1  # days (to resolution, or held) are floored at this when comp
 DRY_RUN = True  # simulate fills against the live books instead of sending orders; set False to trade for real
 MAX_TRADE_SIZE_USD = Decimal("100")  # most contract cost (both legs, before fees) in open positions on one pair
 MAX_PORTFOLIO_SIZE_USD = Decimal("1000")  # most contract cost in open positions across all pairs
+MIN_COMPOUND_RATE_PER_DAY = 0.001  # 0.1%/day: opportunities with a lower compound daily rate aren't entered
 ORDER_TIMEOUT_SECONDS = 10  # an order whose result doesn't come back in time halts trading (state unknown)

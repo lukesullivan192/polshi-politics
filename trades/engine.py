@@ -2,7 +2,8 @@
 
 Entry. For each opportunity (best daily rate first) it buys half the contracts available at the prices
 it wants, both legs at once (asyncio.gather) as fill-or-kill orders, within MAX_TRADE_SIZE_USD per
-pair and MAX_PORTFOLIO_SIZE_USD overall. If only one leg fills, that leg is sold right away.
+pair and MAX_PORTFOLIO_SIZE_USD overall, skipping any whose compound daily rate (at the size taken) is
+below MIN_COMPOUND_RATE_PER_DAY. If only one leg fills, that leg is sold right away.
 
 Cashout. An open position is sold when selling now earns a better daily rate than holding:
 
@@ -120,8 +121,8 @@ class TradeEngine:
         for pos in [p for p in self._positions.values() if p.status == "open"]:
             await self._maybe_cash_out(pos)
         for opp in opportunities:
-            if self.halted:
-                return
+            if self.halted or opp.rate_per_day < config.MIN_COMPOUND_RATE_PER_DAY:
+                return  # ranked best rate first, so the rest are below the minimum too
             await self._enter(opp)
 
     # ---- entry ----
@@ -155,6 +156,8 @@ class TradeEngine:
             sized = best_opportunity(pair, k_book, p_book, now, max_qty=qty, sides=sides)
             if sized is None or sized.qty != qty:
                 return
+        if sized.rate_per_day < config.MIN_COMPOUND_RATE_PER_DAY:
+            return
         # Limit at the prices the full opportunity reaches (2x the depth we need), unless filling all of
         # it at those prices would lose money; then limit at what this size needs.
         k_limit, p_limit = full.kalshi.limit_price, full.poly.limit_price

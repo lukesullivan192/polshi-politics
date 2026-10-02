@@ -181,7 +181,7 @@ The engine logs every profitable opportunity at its full depth. The trades engin
 Each trading cycle, after the opportunity engine has re-evaluated changed pairs, the trades engine:
 1. retries selling any one-legged (`unhedged`) position,
 2. checks every open position for a cashout,
-3. walks the opportunities, best daily rate first, and enters what fits.
+3. walks the opportunities, best daily rate first, and enters what fits, stopping at the first one below `MIN_COMPOUND_RATE_PER_DAY`.
 
 With `DRY_RUN = True` (the default) nothing is sent. `trades/paper.py` fills each order against the live websocket books, and remembers what it took from each market until that market's book next changes. Paper positions are stored with `dry_run = 1` and are kept separate from live ones.
 
@@ -192,6 +192,7 @@ With `DRY_RUN = True` (the default) nothing is sent. `trades/paper.py` fills eac
 | `DRY_RUN` | `True`: simulate fills. `False`: send real orders |
 | `MAX_TRADE_SIZE_USD` | most contract cost (both legs, before fees) in open positions on **one pair**, summed across repeat entries |
 | `MAX_PORTFOLIO_SIZE_USD` | most contract cost in open positions across all pairs. Each venue needs its own share of this in cash; the engine doesn't check balances |
+| `MIN_COMPOUND_RATE_PER_DAY` | lowest compound daily rate, `(final / initial) ^ (1 / days) − 1`, worth entering (0.001 = 0.1%/day). Checked at the size actually taken. The opportunity engine still logs everything below it |
 | `ORDER_TIMEOUT_SECONDS` | how long to wait for an order's result before treating it as unknown |
 
 ### Entry
