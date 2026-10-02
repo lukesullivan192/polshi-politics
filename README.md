@@ -188,8 +188,8 @@ The engine logs every profitable opportunity at its full depth. The trades engin
 
 Each trading cycle, after the opportunity engine has re-evaluated changed pairs, the trades engine:
 1. retries selling any one-legged (`unhedged`) position,
-2. checks every open position for a cashout,
-3. walks the opportunities, best daily rate first, and enters what fits, stopping at the first one below `MIN_COMPOUND_RATE_PER_DAY`.
+2. checks every open position for a cashout (if `STANDARD_CASHOUT`),
+3. walks the opportunities, best daily rate first, and enters what fits, stopping at the first one below `MIN_COMPOUND_RATE_PER_DAY`. If the portfolio cap is what stops one getting its full size, it may swap out a weaker position for it (if `CONDITIONAL_CASHOUT`).
 
 With `DRY_RUN = True` (the default) nothing is sent. `trades/paper.py` fills each order against the live websocket books, and remembers what it took from each market until that market's book next changes. Paper positions are stored with `dry_run = 1` and are kept separate from live ones.
 
@@ -201,6 +201,8 @@ With `DRY_RUN = True` (the default) nothing is sent. `trades/paper.py` fills eac
 | `MAX_TRADE_SIZE_USD` | most contract cost (both legs, before fees) in open positions on **one pair**, summed across repeat entries |
 | `MAX_PORTFOLIO_SIZE_USD` | most contract cost in open positions across all pairs. Each venue needs its own share of this in cash; the engine doesn't check balances |
 | `MIN_COMPOUND_RATE_PER_DAY` | lowest compound daily rate, `(final / initial) ^ (1 / days) − 1`, worth entering (0.001 = 0.1%/day). Checked at the size actually taken. The opportunity engine still logs everything below it |
+| `STANDARD_CASHOUT` | sell a position when cashing out beats holding (see Cashout) |
+| `CONDITIONAL_CASHOUT` | when the portfolio is full, swap the weakest position for a better opportunity (see Conditional cashout) |
 | `ORDER_TIMEOUT_SECONDS` | how long to wait for an order's result before treating it as unknown |
 
 ### Entry
@@ -226,6 +228,22 @@ An open position is sold when selling now earns a better daily rate than holding
 Both day counts are floored at `RATE_MIN_DAYS` (1). Within the first day this means any payout above `initial` plus about one day of the hold rate triggers a cashout.
 
 Both legs are sold at once as fill-or-kill orders. If only one sells, the other is sold straight away (immediate-or-cancel).
+
+### Conditional cashout
+When an opportunity can't get its full size because the portfolio is at `MAX_PORTFOLIO_SIZE_USD`, the engine considers selling an open position to make room. It picks the position with the lowest **forward rate**, which is what holding it from now to resolution earns on the money you'd get by selling it now:
+
+```
+(final / payout) ^ (1 / days_left) − 1
+```
+
+The entry rate doesn't matter here. That money is already spent. The real choice is between leaving `payout` in this position or moving it into the new trade, and the forward rate is what staying put earns. A position whose prices have moved in your favour has a low forward rate: most of its profit is already in the bid, so it's the cheapest money to free up.
+
+The swap happens only if all of these hold:
+- selling realizes a profit (`payout > initial`), so positions are never dumped at a loss and a just-opened position (still below `initial` after fees) is never churned,
+- the opportunity's daily rate (after its entry fees) beats the position's forward rate (after exit fees),
+- in dollars per day it beats holding too: `deployable × new_rate > payout × forward_rate`, where `deployable` is what the new trade can actually absorb with the freed room. This stops a large position being sold to fund a small trade, with the rest sitting idle.
+
+The position is sold as in a normal cashout (stored with reason `cashout`, logged as `SWAP`), then the opportunity is entered. Positions on the same pair are never swapped for themselves.
 
 ### Settlement
 When both of a position's markets have left the venues (they've closed), the position is closed with reason `settled`, assuming the winning leg pays $1 per contract.

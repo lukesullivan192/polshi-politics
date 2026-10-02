@@ -5,12 +5,17 @@ it wants, both legs at once (asyncio.gather) as fill-or-kill orders, within MAX_
 pair and MAX_PORTFOLIO_SIZE_USD overall, skipping any whose compound daily rate (at the size taken) is
 below MIN_COMPOUND_RATE_PER_DAY. If only one leg fills, that leg is sold right away.
 
-Cashout. An open position is sold when selling now earns a better daily rate than holding:
+Cashout (STANDARD_CASHOUT). An open position is sold when selling now earns a better daily rate than holding:
 
     (payout / initial) ^ (1 / days_held) - 1  >  (final / initial) ^ (1 / days_total) - 1
 
 payout = what both legs sell for into the current bids, after fees; initial = entry cost + fees;
 final = contracts (each pays $1); days_held and days_total (entry to resolution) floored at RATE_MIN_DAYS.
+
+Conditional cashout (CONDITIONAL_CASHOUT). When the portfolio cap stops an opportunity getting its full
+size, the open position with the lowest forward rate, (final / payout) ^ (1 / days_left) - 1, is sold to
+make room, if selling realizes a profit (payout > initial) and the opportunity beats it in both daily
+rate and dollars per day.
 
 Every order is written to the trades DB and the log. With DRY_RUN on, orders are filled by PaperClient
 against the live books and nothing is sent.
@@ -127,58 +132,30 @@ class TradeEngine:
             return
         for pos in [p for p in self._positions.values() if p.status == "unhedged"]:
             await self._unwind(pos)
-        for pos in [p for p in self._positions.values() if p.status == "open"]:
-            await self._maybe_cash_out(pos)
+        if config.STANDARD_CASHOUT:
+            for pos in [p for p in self._positions.values() if p.status == "open"]:
+                await self._maybe_cash_out(pos)
         for opp in opportunities:
             if self.halted or opp.rate_per_day < config.MIN_COMPOUND_RATE_PER_DAY:
                 return  # ranked best rate first, so the rest are below the minimum too
             await self._enter(opp)
+            if config.CONDITIONAL_CASHOUT and not self.halted:
+                await self._maybe_swap(opp)
 
     # ---- entry ----
 
     async def _enter(self, opp: Opportunity) -> None:
-        pair = self._opps.pairs.get(opp.pair_id)
-        if pair is None:
-            return
-        k_book = self._book("kalshi", pair.kalshi_market_id)
-        p_book = self._book("polymarket", pair.poly_slug)
-        if k_book is None or p_book is None:
-            return
         room = min(
-            config.MAX_TRADE_SIZE_USD - self._exposure(pair.pair_id),
+            config.MAX_TRADE_SIZE_USD - self._exposure(opp.pair_id),
             config.MAX_PORTFOLIO_SIZE_USD - self._exposure(),
         )
-        if room <= 0:
+        plan = self._plan_entry(opp, room)
+        if plan is None:
             return
-        now = datetime.now(timezone.utc)
-        full = best_opportunity(pair, k_book, p_book, now)
-        if full is None:
-            return
-        sides = (full.kalshi.side, full.poly.side)
-        # Half the contracts available at the prices we want, so the book can thin out before we arrive.
-        half = _whole(full.qty / 2)
-        sized = best_opportunity(pair, k_book, p_book, now, max_qty=half, max_cost=room, sides=sides)
-        if sized is None or _whole(sized.qty) < 1:
-            return
-        qty = _whole(sized.qty)
-        if qty != sized.qty:
-            sized = best_opportunity(pair, k_book, p_book, now, max_qty=qty, sides=sides)
-            if sized is None or sized.qty != qty:
-                return
-        if sized.rate_per_day < config.MIN_COMPOUND_RATE_PER_DAY:
-            return
-        # Limit at the prices the full opportunity reaches (2x the depth we need), unless filling all of
-        # it at those prices would lose money; then limit at what this size needs.
-        k_limit, p_limit = full.kalshi.limit_price, full.poly.limit_price
-        if not self._profitable_at(pair, qty, k_limit, p_limit):
-            k_limit, p_limit = sized.kalshi.limit_price, sized.poly.limit_price
-        reqs = [
-            OrderRequest("kalshi", pair.kalshi_market_id, sides[0], "buy", qty, k_limit, "fok"),
-            OrderRequest("polymarket", pair.poly_slug, sides[1], "buy", qty, p_limit, "fok"),
-        ]
+        pair, sized, reqs, now = plan
         log.info(
             "%sENTER pair %d: %s contracts, expected cost $%.2f fees $%.2f profit $%.2f, %.4f%%/day",
-            _tag(), pair.pair_id, qty, sized.cost, sized.fees, sized.profit, sized.rate_per_day * 100,
+            _tag(), pair.pair_id, sized.qty, sized.cost, sized.fees, sized.profit, sized.rate_per_day * 100,
         )
         k_fill, p_fill = await asyncio.gather(*(self._clients[r.venue].place(r) for r in reqs))
         if k_fill.qty <= 0 and p_fill.qty <= 0:
@@ -186,7 +163,7 @@ class TradeEngine:
                 self._record_order(None, pair.pair_id, "entry", req, fill)
             self._halt_if_unknown(k_fill, p_fill)
             return
-        pos = self._open_position(pair, sides, k_fill, p_fill, now)
+        pos = self._open_position(pair, (reqs[0].side, reqs[1].side), k_fill, p_fill, now)
         for req, fill in zip(reqs, (k_fill, p_fill)):
             self._record_order(pos.position_id, pair.pair_id, "entry", req, fill)
         if self._halt_if_unknown(k_fill, p_fill):
@@ -199,6 +176,44 @@ class TradeEngine:
         else:
             log.warning("%sPOSITION %d one-legged (kalshi %s, polymarket %s); selling it", _tag(), pos.position_id, pos.kalshi_qty, pos.poly_qty)
             await self._unwind(pos)
+
+    def _plan_entry(self, opp: Opportunity, room: Decimal) -> tuple[Pair, Opportunity, list[OrderRequest], datetime] | None:
+        """Size an entry within `room` dollars of contract cost: (pair, sized opportunity, orders, now), or
+        None if there's nothing worth entering."""
+        pair = self._opps.pairs.get(opp.pair_id)
+        if pair is None or room <= 0:
+            return None
+        k_book = self._book("kalshi", pair.kalshi_market_id)
+        p_book = self._book("polymarket", pair.poly_slug)
+        if k_book is None or p_book is None:
+            return None
+        now = datetime.now(timezone.utc)
+        full = best_opportunity(pair, k_book, p_book, now)
+        if full is None:
+            return None
+        sides = (full.kalshi.side, full.poly.side)
+        # Half the contracts available at the prices we want, so the book can thin out before we arrive.
+        half = _whole(full.qty / 2)
+        sized = best_opportunity(pair, k_book, p_book, now, max_qty=half, max_cost=room, sides=sides)
+        if sized is None or _whole(sized.qty) < 1:
+            return None
+        qty = _whole(sized.qty)
+        if qty != sized.qty:
+            sized = best_opportunity(pair, k_book, p_book, now, max_qty=qty, sides=sides)
+            if sized is None or sized.qty != qty:
+                return None
+        if sized.rate_per_day < config.MIN_COMPOUND_RATE_PER_DAY:
+            return None
+        # Limit at the prices the full opportunity reaches (2x the depth we need), unless filling all of
+        # it at those prices would lose money; then limit at what this size needs.
+        k_limit, p_limit = full.kalshi.limit_price, full.poly.limit_price
+        if not self._profitable_at(pair, qty, k_limit, p_limit):
+            k_limit, p_limit = sized.kalshi.limit_price, sized.poly.limit_price
+        reqs = [
+            OrderRequest("kalshi", pair.kalshi_market_id, sides[0], "buy", qty, k_limit, "fok"),
+            OrderRequest("polymarket", pair.poly_slug, sides[1], "buy", qty, p_limit, "fok"),
+        ]
+        return pair, sized, reqs, now
 
     def _profitable_at(self, pair: Pair, qty: Decimal, k_price: Decimal, p_price: Decimal) -> bool:
         cost = qty * (k_price + p_price)
@@ -246,17 +261,10 @@ class TradeEngine:
     # ---- cashout ----
 
     async def _maybe_cash_out(self, pos: Position) -> None:
-        k_book = self._book("kalshi", pos.kalshi_market_id)
-        p_book = self._book("polymarket", pos.poly_slug)
-        if k_book is None or p_book is None:
+        quote = self._exit_quote(pos)
+        if quote is None:
             return
-        k_fills = walk(k_book.bids(pos.kalshi_side), pos.qty)
-        p_fills = walk(p_book.bids(pos.poly_side), pos.qty)
-        if k_fills is None or p_fills is None:
-            return  # not enough bids to sell the whole position
-        proceeds = _total(k_fills) + _total(p_fills)
-        exit_fees = kalshi_fee(k_fills, pos.kalshi_fee_multiplier) + polymarket_fee(p_fills)
-        payout = proceeds - exit_fees
+        k_fills, p_fills, payout = quote
         initial = pos.cost + pos.fees
         now = datetime.now(timezone.utc)
         days_held = max((now - pos.opened_at).total_seconds() / 86400, config.RATE_MIN_DAYS)
@@ -269,6 +277,63 @@ class TradeEngine:
             "%sCASHOUT position %d: payout $%.2f on $%.2f = %.4f%%/day over %.1f days held > %.4f%%/day holding",
             _tag(), pos.position_id, payout, initial, cash_out_rate * 100, days_held, hold_rate * 100,
         )
+        await self._sell(pos, k_fills, p_fills)
+
+    async def _maybe_swap(self, opp: Opportunity) -> None:
+        """Conditional cashout: if the portfolio cap is what stops `opp` getting its full size, sell the open
+        position with the lowest forward rate (holding it from here to resolution) and enter `opp` with the
+        money, provided selling realizes a profit and `opp` earns more per day in both rate and dollars."""
+        pair_room = config.MAX_TRADE_SIZE_USD - self._exposure(opp.pair_id)
+        portfolio_room = config.MAX_PORTFOLIO_SIZE_USD - self._exposure()
+        if portfolio_room >= pair_room:
+            return  # the portfolio cap isn't what's limiting this pair
+        plan = self._plan_entry(opp, pair_room)
+        if plan is None:
+            return
+        sized = plan[1]
+        now = datetime.now(timezone.utc)
+        worst = None
+        for pos in self._positions.values():
+            if pos.status != "open" or pos.pair_id == opp.pair_id:
+                continue
+            quote = self._exit_quote(pos)
+            if quote is None or quote[2] <= pos.cost + pos.fees:
+                continue  # can't sell it all, or selling now would lock in a loss
+            forward_rate = daily_rate(pos.qty, quote[2], days_until(pos.resolution_date, now))
+            if worst is None or forward_rate < worst[1]:
+                worst = (pos, forward_rate, quote)
+        if worst is None:
+            return
+        pos, forward_rate, (k_fills, p_fills, payout) = worst
+        # Dollars per day: what the new trade can absorb at its rate vs what the payout earns staying put.
+        deployable = min(sized.cost + sized.fees, portfolio_room + pos.cost)
+        if sized.rate_per_day <= forward_rate or deployable * Decimal(sized.rate_per_day) <= payout * Decimal(forward_rate):
+            return
+        log.info(
+            "%sSWAP position %d (%.4f%%/day holding from here, payout $%.2f) for pair %d (%.4f%%/day on $%.2f)",
+            _tag(), pos.position_id, forward_rate * 100, payout, opp.pair_id, sized.rate_per_day * 100, deployable,
+        )
+        await self._sell(pos, k_fills, p_fills)  # stored as a cashout
+        if pos.position_id not in self._positions and not self.halted:
+            await self._enter(opp)
+
+    def _exit_quote(self, pos: Position) -> tuple[list[Level], list[Level], Decimal] | None:
+        """(kalshi fills, polymarket fills, payout after fees) for selling the whole position into the
+        current bids, or None if the bids can't absorb it."""
+        k_book = self._book("kalshi", pos.kalshi_market_id)
+        p_book = self._book("polymarket", pos.poly_slug)
+        if k_book is None or p_book is None:
+            return None
+        k_fills = walk(k_book.bids(pos.kalshi_side), pos.qty)
+        p_fills = walk(p_book.bids(pos.poly_side), pos.qty)
+        if k_fills is None or p_fills is None:
+            return None
+        proceeds = _total(k_fills) + _total(p_fills)
+        exit_fees = kalshi_fee(k_fills, pos.kalshi_fee_multiplier) + polymarket_fee(p_fills)
+        return k_fills, p_fills, proceeds - exit_fees
+
+    async def _sell(self, pos: Position, k_fills: list[Level], p_fills: list[Level]) -> None:
+        """Sell both legs of a position at once (FOK) down to the quoted prices; a one-legged result is unwound."""
         reqs = [
             OrderRequest("kalshi", pos.kalshi_market_id, pos.kalshi_side, "sell", pos.qty, k_fills[-1][0], "fok"),
             OrderRequest("polymarket", pos.poly_slug, pos.poly_side, "sell", pos.qty, p_fills[-1][0], "fok"),
