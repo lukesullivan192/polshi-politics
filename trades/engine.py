@@ -554,7 +554,7 @@ class TradeEngine:
         ledger.info("    %s", self._portfolio_summary())
 
     def _portfolio_summary(self) -> str:
-        """Value at startup, now and once open positions resolve, plus the expected annualized return."""
+        """Value at startup, now and once open positions resolve, plus the expected annualized continuous return."""
         if self._cash is None:
             return "portfolio: unknown (couldn't read venue balances at startup)"
         positions = list(self._positions.values())
@@ -572,8 +572,8 @@ class TradeEngine:
         payout = sum((p.qty for p in hedged), ZERO)
         deployed = sum((_basis(p) for p in hedged), ZERO)
         days = sum(float(p.qty) * days_until(p.resolution_date, now) for p in hedged) / float(payout)  # payout-weighted
-        on_portfolio = float(at_resolution / value) ** (365 / days) - 1
-        on_deployed = float(payout / deployed) ** (365 / days) - 1
+        on_portfolio = daily_rate(at_resolution, value, days) * 365
+        on_deployed = daily_rate(payout, deployed, days) * 365
         return out + (
             f" | expected annualized {on_portfolio * 100:.2f}% on the portfolio, {on_deployed * 100:.2f}% on "
             f"${deployed:.2f} deployed ({len(hedged)} positions, {days:.1f} days to resolution on average)"

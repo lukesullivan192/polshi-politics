@@ -296,7 +296,7 @@ portfolio: start $177.40 | now $177.40 (+0.00) | at resolution $177.65 (+0.25) |
 - **start**: portfolio value when the bot launched
 - **now**: cash plus open positions at cost (entry cost and fees), so it moves with realized profit and loss, not with the bid
 - **at resolution**: cash plus $1 per contract of every open position, if they're held to resolution
-- **expected annualized**: `(at resolution / now) ^ (365 / days) − 1` on the whole portfolio, and `(payout / cost) ^ (365 / days) − 1` on the deployed money alone. `days` is the payout-weighted average time to resolution (floored at `RATE_MIN_DAYS`)
+- **expected annualized**: continuous, `365 × ln(at resolution / now) / days` on the whole portfolio, and `365 × ln(payout / cost) / days` on the deployed money alone (the daily rate × 365). `days` is the payout-weighted average time to resolution (floored at `RATE_MIN_DAYS`)
 
 Cash is read once at startup from both venues (Kalshi `GET /portfolio/balance`, Polymarket US `GET /v1/account/balances` buying power) and is then moved by our own fills and settlements. Trades made by hand on the venues aren't seen until the next restart. In a dry run, cash starts at `MAX_PORTFOLIO_SIZE_USD`, less what open paper positions cost. These lines also go to the main log.
 
