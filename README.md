@@ -1,4 +1,4 @@
-# polshi-politics-arb
+# polshi-politics-bot
 
 A bot for finding arbitrage between politics and elections markets on [Kalshi](https://kalshi.com) and [Polymarket US](https://polymarket.us).
 
