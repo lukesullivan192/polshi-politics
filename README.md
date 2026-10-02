@@ -206,7 +206,7 @@ With `DRY_RUN = True` nothing is sent. `trades/paper.py` fills each order agains
 | `DRY_RUN` | `True`: simulate fills. `False`: send real orders |
 | `MAX_TRADE_SIZE_USD` | most contract cost (both legs, before fees) in open positions on **one pair**, summed across repeat entries |
 | `MAX_PORTFOLIO_SIZE_USD` | most contract cost in open positions across all pairs. Each venue needs its own share of this in cash; the engine doesn't check balances |
-| `MIN_RATE_PER_DAY` | lowest continuous daily rate, `ln(final / initial) / days`, worth entering (0.001 = 0.1%/day). Checked at the size actually taken. The opportunity engine still logs everything below it |
+| `MIN_RATE_PER_DAY` | lowest continuous daily rate, `ln(final / initial) / days`, worth entering (0.0005 = 0.05%/day). Checked at the size actually taken. The opportunity engine still logs everything below it |
 | `MAX_MARGIN` | highest margin, profit / (cost + fees), worth entering (0.10 = 10%). Anything better is usually a price that flickers onto a book and is gone before our order lands. Checked at the size actually taken |
 | `STANDARD_CASHOUT` | sell a position when cashing out beats holding (see Cashout) |
 | `CONDITIONAL_CASHOUT` | when the portfolio is full, swap the weakest position for a better opportunity (see Conditional cashout) |
@@ -255,7 +255,7 @@ The swap happens only if all of these hold:
 - the opportunity's daily rate (after its entry fees) beats the position's forward rate (after exit fees),
 - in dollars per day it beats holding too: `deployable × new_rate > payout × forward_rate`, where `deployable` is what the new trade can actually absorb with the freed room. This stops a large position being sold to fund a small trade, with the rest sitting idle.
 
-The position is sold as in a normal cashout (stored with reason `cashout`, logged as `SWAP`), then the opportunity is entered. Positions on the same pair are never swapped for themselves.
+The position is sold as in a normal cashout (stored with reason `cashout`, logged as `SWAP`), then the opportunity is entered. The swap is checked before the entry, since an entry attempt starts the pair's cooldown. Each opportunity frees room by selling at most one position per cycle; if it still can't get its full size, the next cycle can swap out another. Positions on the same pair are never swapped for themselves.
 
 ### Settlement
 When both of a position's markets have left the venues (they've closed), the position is closed with reason `settled`, assuming the winning leg pays $1 per contract.

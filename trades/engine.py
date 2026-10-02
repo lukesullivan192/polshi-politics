@@ -180,9 +180,11 @@ class TradeEngine:
         for opp in opportunities:
             if self.halted or opp.rate_per_day < config.MIN_RATE_PER_DAY:
                 return  # ranked best rate first, so the rest are below the minimum too
-            await self._enter(opp)
-            if config.CONDITIONAL_CASHOUT and not self.halted:
+            # Swap before entering: entering starts the pair's cooldown, which would stop the swap's plan.
+            if config.CONDITIONAL_CASHOUT:
                 await self._maybe_swap(opp)
+            if not self.halted:
+                await self._enter(opp)
 
     # ---- entry ----
 
@@ -410,8 +412,9 @@ class TradeEngine:
 
     async def _maybe_swap(self, opp: Opportunity) -> None:
         """Conditional cashout: if the portfolio cap is what stops `opp` getting its full size, sell the open
-        position with the lowest forward rate (holding it from here to resolution) and enter `opp` with the
-        money, provided selling realizes a profit and `opp` earns more per day in both rate and dollars."""
+        position with the lowest forward rate (holding it from here to resolution) to make room for `opp`
+        (entered next by cycle), provided selling realizes a profit and `opp` earns more per day in both
+        rate and dollars."""
         pair_room = config.MAX_TRADE_SIZE_USD - self._exposure(opp.pair_id)
         portfolio_room = config.MAX_PORTFOLIO_SIZE_USD - self._exposure()
         if portfolio_room >= pair_room:
@@ -443,8 +446,6 @@ class TradeEngine:
             _tag(), pos.position_id, forward_rate * 100, payout, opp.pair_id, sized.rate_per_day * 100, deployable,
         )
         await self._sell(pos, k_fills, p_fills)  # stored as a cashout
-        if pos.position_id not in self._positions and not self.halted:
-            await self._enter(opp)
 
     def _exit_quote(self, pos: Position) -> tuple[list[Level], list[Level], Decimal] | None:
         """(kalshi fills, polymarket fills, payout after fees) for selling the whole position into the
